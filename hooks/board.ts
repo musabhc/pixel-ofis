@@ -1,4 +1,4 @@
-import type { BoardInfo, Chronicle, FileChange, Peer, WorkerStatus } from '../types'
+import type { BoardInfo, Chronicle, FileChange, Finding, Peer, WorkerStatus } from '../types'
 
 // The board: who each chat is, what it is for and which files it changed. Pure
 // helpers; the hooks module reads and writes the folders.
@@ -85,9 +85,17 @@ export function statusWord(status: WorkerStatus | undefined): string {
   return status ? STATUS_WORDS[status] : 'boşta'
 }
 
-// The note the model reads beside a prompt while other chats share the repository:
-// who they are and what they touched, so nobody has to ask, list or re-read to know.
-export function boardNote(selfLabel: string, self: BoardInfo, peers: Peer[], history: Chronicle[], now: number): string | null {
+// The note the model reads when it first changes a file while other chats share the
+// machine: who they are and what they touched, so nobody has to ask, list or re-read
+// to know. `withHowTo` adds how to reach them, said once per conversation.
+export function boardNote(
+  selfLabel: string,
+  self: BoardInfo,
+  peers: Peer[],
+  history: Chronicle[],
+  now: number,
+  withHowTo = true,
+): string | null {
   const lines: string[] = []
   for (const peer of peers) {
     const chief = peer.workers.find(worker => worker.id === 'main')
@@ -105,8 +113,118 @@ export function boardNote(selfLabel: string, self: BoardInfo, peers: Peer[], his
     '[Piksel Ofis panosu: aynı makinede çalışan diğer sohbetler]',
     `Bu sohbet: ${selfLabel || '#?'} "${titleOf(self)}".`,
     ...lines,
-    'Bu dosyalara dokunmadan önce güncel hâlini oku ve onların değişikliğini geri alma. Bir sohbete yazman gerekirse mcp__pixel-ofis__ofis_mesaj aracını kullan (önce ToolSearch "select:mcp__pixel-ofis__ofis_mesaj").',
+    withHowTo
+      ? 'Bu dosyalara dokunmadan önce güncel hâlini oku ve onların değişikliğini geri alma. Bir sohbete yazman gerekirse mcp__pixel-ofis__ofis_mesaj aracını kullan (önce ToolSearch "select:mcp__pixel-ofis__ofis_mesaj").'
+      : 'Bu dosyalara dokunmadan önce güncel hâlini oku ve onların değişikliğini geri alma.',
   ].join('\n')
+}
+
+// ---- Compaction ----------------------------------------------------------------------
+
+// What a compaction's summary must keep, told from the board: what the chat is for,
+// what it was asked lately and which files it changed.
+export const COMPACT_MARK = 'Piksel Ofis panosuna göre bu sohbet:'
+
+export function compactInstructions(info: BoardInfo, project: string): string | null {
+  if (!info.purpose && info.tasks.length === 0 && info.files.length === 0) return null
+  const lines = [COMPACT_MARK]
+  if (info.name) lines.push(`- Adı: ${info.name}`)
+  if (info.purpose) lines.push(`- Amacı: ${info.purpose}`)
+  if (info.tasks.length > 0) lines.push(`- Son görevleri: ${info.tasks.join(' | ')}`)
+  if (info.files.length > 0) lines.push(`- Değiştirdiği dosyalar: ${filesLine(info.files, project, MAX_FILES)}`)
+  lines.push('Özette bunları, verilen kararları ve yarım kalan işleri koru; dosya içeriklerini değil, yollarını tut.')
+
+  return lines.join('\n')
+}
+
+// ---- A held Write: the file's uncommitted changes ------------------------------------
+
+const DIFF_LINES = 60
+const DIFF_CHARS = 4000
+
+// `git diff` of the file, cut to what is worth reading in a refusal.
+export function clipDiff(diff: string): string {
+  const lines = diff.replace(/\r\n/g, '\n').split('\n').filter(line => !/^(diff --git|index |--- |\+\+\+ )/.test(line))
+  let kept = lines.slice(0, DIFF_LINES).join('\n').trim()
+  if (kept.length > DIFF_CHARS) kept = `${kept.slice(0, DIFF_CHARS)}\n…`
+  else if (lines.length > DIFF_LINES) kept += `\n… (+${lines.length - DIFF_LINES} satır)`
+
+  return kept
+}
+
+export function heldWriteText(conflicts: Conflict[], diff: string, now: number): string {
+  const seen = diff
+    ? `\nDosyanın commit edilmemiş değişiklikleri (onlarınki burada):\n\`\`\`diff\n${diff}\n\`\`\``
+    : ''
+
+  return (
+    `${conflictText(conflicts, now)}${seen}\n` +
+    'Dosyanın tamamını yeniden yazmak yerine Edit ile yalnız kendi değiştireceğin yeri değiştir: onların değişikliği korunur, ' +
+    'tüm dosyayı yeniden üretmek gerekmez. Write gerçekten gerekiyorsa dosyanın güncel hâlini Read ile oku ve Write\'ı yeniden çağır.'
+  )
+}
+
+// ---- Findings: subagent reports other chats may reuse --------------------------------
+
+export const FINDING_WINDOW_MS = 2 * 60 * 60 * 1000
+export const FINDING_SUMMARY = 1500
+// Two research briefs this alike are taken for the same question.
+const SAME_BRIEF = 0.6
+const MIN_WORDS = 4
+
+const words = (text: string): Set<string> =>
+  new Set(
+    text
+      .toLocaleLowerCase('tr')
+      .split(/[^\p{L}\p{N}_]+/u)
+      .filter(word => word.length >= 3),
+  )
+
+// How alike two briefs are: the words they share over the shorter one's words.
+export function briefLikeness(a: string, b: string): number {
+  const left = words(a)
+  const right = words(b)
+  const small = Math.min(left.size, right.size)
+  if (small < MIN_WORDS) return 0
+  let shared = 0
+  for (const word of left) if (right.has(word)) shared += 1
+
+  return shared / small
+}
+
+// Another chat's report on the same question in the same project, lately: the best one.
+export function matchingFinding(brief: string, project: string, findings: Finding[], now: number): Finding | null {
+  let best: { finding: Finding; score: number } | null = null
+  for (const finding of findings) {
+    if (now - finding.at > FINDING_WINDOW_MS) continue
+    if (project && finding.project && finding.project.toLowerCase() !== project.toLowerCase()) continue
+    const score = briefLikeness(brief, `${finding.description} ${finding.prompt}`)
+    if (score >= SAME_BRIEF && (!best || score > best.score)) best = { finding, score }
+  }
+
+  return best?.finding ?? null
+}
+
+export function findingText(finding: Finding, now: number): string {
+  return (
+    `Piksel Ofis: ${finding.label || 'başka bir sohbet'} bu soruyu ${ago(finding.at, now)} bir alt ajana (${finding.type}) araştırttı: "${finding.description}". ` +
+    `Raporunun başı:\n<<<\n${finding.summary}\n>>>\n` +
+    'Bu yeterliyse alt ajanı başlatma, bununla devam et. Yetmiyorsa ya da güncel olmayabilirse aynı Agent çağrısını yeniden yap: ikinci çağrı durdurulmaz.'
+  )
+}
+
+export function parseFindings(text: string): Finding[] {
+  try {
+    const value = JSON.parse(text) as unknown
+    if (!Array.isArray(value)) return []
+
+    return value.filter(
+      (one): one is Finding =>
+        typeof one === 'object' && one !== null && typeof (one as Finding).id === 'string' && typeof (one as Finding).summary === 'string',
+    )
+  } catch {
+    return []
+  }
 }
 
 export function parseChronicle(text: string): Chronicle | null {

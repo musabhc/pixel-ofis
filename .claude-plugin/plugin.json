@@ -1,11 +1,11 @@
 {
   "name": "pixel-ofis",
-  "version": "0.2.0",
-  "description": "Pixel-art office pane for Claude Code: the session and its subagents as workers, a board of every chat working on the machine, usage meters and a task box",
+  "version": "0.3.0",
+  "description": "Pixel-art office pane for Claude Code: the session and its subagents as workers, a board of every chat working on the machine, usage meters, token-saving helpers and a task box",
   "author": { "name": "musabhc" },
   "homepage": "https://github.com/musabhc/pixel-ofis",
   "repository": "https://github.com/musabhc/pixel-ofis",
   "license": "MIT",
-  "keywords": ["pane", "office", "pixel-art", "multi-session"],
+  "keywords": ["pane", "office", "pixel-art", "multi-session", "tokens"],
   "types": "./types/index.d.ts"
 }

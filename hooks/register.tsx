@@ -1,15 +1,24 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionContextUsage, SessionCost, SessionRateLimit, Timer } from 'claude-code'
 
-import type { Attachment, BoardInfo, Chronicle, Live, LogEntry, Peer, Station, Team, Usage, Worker } from '../types'
+import type { Attachment, BoardInfo, Chronicle, Finding, Live, LogEntry, Peer, Station, Team, ToolSize, Usage, Worker } from '../types'
 import {
   ago,
   boardNote,
+  clipDiff,
+  COMPACT_MARK,
+  compactInstructions,
   conflictsFor,
   conflictText,
   EMPTY_BOARD,
   filesLine,
+  FINDING_SUMMARY,
+  FINDING_WINDOW_MS,
+  findingText,
+  heldWriteText,
+  matchingFinding,
   parseChronicle,
+  parseFindings,
   pathKey,
   statusWord,
   titleOf,
@@ -17,6 +26,21 @@ import {
   withTask,
 } from './board'
 import { officeAlt, officeSvg } from './scene'
+import type { CacheGauge } from './scene'
+import {
+  approxTokens,
+  callLabel,
+  EMPTY_TOKENS,
+  fixedLoad,
+  fromUsage,
+  hitPercent,
+  kilo,
+  learnTtl,
+  warmth,
+  warmthText,
+  withOutput,
+  withTurn,
+} from './tokens'
 
 const PANE = 'pixel-ofis'
 const TITLE = 'Piksel Ofis'
@@ -42,8 +66,28 @@ const live = atom({ plugin: 'pixel-ofis', key: 'live' } as const, { slot: null, 
 const board = atom({ plugin: 'pixel-ofis', key: 'board' } as const, EMPTY_BOARD, { shape: 'board-1' })
 const history = atom({ plugin: 'pixel-ofis', key: 'history' } as const, [], { shape: 'history-1' })
 const attachments = atom({ plugin: 'pixel-ofis', key: 'attachments' } as const, [], { shape: 'attachments-1' })
-const rounds = atom({ plugin: 'pixel-ofis', key: 'rounds' } as const, { task: 0, attach: 0, name: 0 }, { shape: 'rounds-2' })
+const rounds = atom({ plugin: 'pixel-ofis', key: 'rounds' } as const, { task: 0, attach: 0, name: 0, defer: 0 }, { shape: 'rounds-3' })
 const canFill = atom({ plugin: 'pixel-ofis', key: 'canFill' } as const, true, { shape: 'can-fill-1' })
+const tokens = atom({ plugin: 'pixel-ofis', key: 'tokens' } as const, EMPTY_TOKENS, { shape: 'tokens-1' })
+const load = atom({ plugin: 'pixel-ofis', key: 'load' } as const, null, { shape: 'load-1' })
+const findings = atom({ plugin: 'pixel-ofis', key: 'findings' } as const, [], { shape: 'findings-1' })
+const deferred = atom({ plugin: 'pixel-ofis', key: 'deferred' } as const, [], { shape: 'deferred-1' })
+const toolSizes = atom({ plugin: 'pixel-ofis', key: 'toolSizes' } as const, [], { shape: 'tool-sizes-1' })
+const cacheTtl = atom({ plugin: 'pixel-ofis', key: 'cacheTtl' } as const, null, { shape: 'cache-ttl-1' })
+
+// Kept across sessions in the plugin's store.
+const STORE_DEFERRED = 'deferredTools'
+const STORE_TTL = 'cacheTtlMs'
+// The pane offers a compaction from this share of the context window on.
+const COMPACT_OFFER_PERCENT = 60
+// And says so once, in a toast, from this share on.
+const COMPACT_HINT_PERCENT = 70
+// A subagent's answer shorter than this is no report worth keeping.
+const MIN_FINDING_CHARS = 200
+const FINDINGS_KEPT = 10
+const FINDINGS_SHOWN = 12
+// ToolSearch loads the deferred tools: it can never wait behind itself.
+const NEVER_DEFERRED = new Set(['ToolSearch'])
 
 // Every chat writes its team to a slot file of one folder and reads the others':
 // a fixed pool, so nothing has to be deleted when a chat goes away.
@@ -55,6 +99,7 @@ const MAX_ATTACHMENTS = 8
 const RESEND_GUARD_MS = 15000
 // The journal folder is read every tenth tick: ended chats change seldom.
 const HISTORY_EVERY = 10
+const REDRAW_EVERY = 20
 const HISTORY_SPAN_MS = 24 * 60 * 60 * 1000
 const HISTORY_SHOWN = 6
 // A conflict note after an Edit is repeated for one path at most this often.
@@ -86,11 +131,21 @@ let link: Link | null = null
 let timer: Timer | null = null
 let draft = ''
 let lastSent = { text: '', at: 0 }
-// The board note the model last read, so an unchanged board costs no tokens again.
+// The board note the model last read, so an unchanged board costs no tokens again,
+// and whether it was told how to message another chat in this conversation.
 let lastNote = ''
+let howToSaid = false
 // Paths whose overwrite was held back once, and when a conflict note was last added.
 const heldWrites = new Set<string>()
 const notedAt = new Map<string, number>()
+// The subagents this chat started, by id: the brief a finished report answers.
+const briefs = new Map<string, { type: string; description: string; prompt: string }>()
+// Agent calls held back once for another chat's report: the finding and the brief.
+const heldAgents = new Set<string>()
+// When the main loop's current turn started, and how full the context was then.
+let turnStartedAt = 0
+let contextAtStart: number | null = null
+let compactHinted = false
 
 const ROLE_NAMES: Record<string, string> = {
   'general-purpose': 'Usta',
@@ -256,6 +311,59 @@ async function readHistory($: EngineInterface, now: number, liveIds: Set<string>
   return found
 }
 
+const findingsDir = (dir: string): string => `${dir}/findings`
+
+// The other chats' subagent reports of the last two hours, newest first.
+async function readFindings($: EngineInterface, now: number): Promise<Finding[]> {
+  if (!link) return []
+  const dir = findingsDir(link.dir)
+  const own = `${link.sessionId}.json`
+  const entries = (await $.fs.list(dir).catch(() => [])).filter(
+    entry => entry.kind === 'file' && entry.name.endsWith('.json') && entry.name !== own && now - entry.mtimeMs < FINDING_WINDOW_MS,
+  )
+  const found: Finding[] = []
+  for (const entry of entries) {
+    const text = await $.fs.read(`${dir}/${entry.name}`).catch(() => '')
+    if (typeof text === 'string') found.push(...parseFindings(text).filter(one => now - one.at < FINDING_WINDOW_MS))
+  }
+
+  return found.sort((a, b) => b.at - a.at).slice(0, FINDINGS_SHOWN)
+}
+
+// A finished subagent's report, kept in this chat's findings file for the others.
+async function saveFinding($: EngineInterface, agentId: string, answer: string): Promise<void> {
+  const brief = briefs.get(agentId)
+  if (!link || !brief) return
+  briefs.delete(agentId)
+  const { slot } = await read($, live)
+  const path = `${findingsDir(link.dir)}/${link.sessionId}.json`
+  const before = await $.fs.read(path).catch(() => '')
+  const kept = typeof before === 'string' ? parseFindings(before) : []
+  const finding: Finding = {
+    id: `${link.sessionId}:${agentId}`,
+    sessionId: link.sessionId,
+    label: slot === null ? '' : `#${slot + 1}`,
+    project: link.project,
+    type: brief.type,
+    description: clip(brief.description, 80),
+    prompt: clip(brief.prompt, 600),
+    summary: answer.trim().slice(0, FINDING_SUMMARY),
+    at: await $.clock.now(),
+  }
+  await $.fs.write(path, JSON.stringify([finding, ...kept.filter(one => one.id !== finding.id)].slice(0, FINDINGS_KEPT)))
+}
+
+// The file's uncommitted changes, as git tells them; nothing when git cannot.
+async function fileDiff($: EngineInterface, path: string): Promise<string> {
+  const dir = path.replace(/[\\/][^\\/]*$/, '') || '.'
+  const ran = await $.process
+    .run(['git', '-C', dir, 'diff', '--no-color', '--unified=2', '--', path], { timeoutMs: 5000 })
+    .catch(() => null)
+  if (!ran || ran.exitCode !== 0) return ''
+
+  return clipDiff(ran.stdout)
+}
+
 async function readSlots($: EngineInterface, dir: string): Promise<(Snapshot | null)[]> {
   const slots: (Snapshot | null)[] = Array.from({ length: SLOT_COUNT }, () => null)
   const names = new Set((await $.fs.list(dir).catch(() => [])).map(entry => entry.name))
@@ -337,7 +445,11 @@ async function tick($: EngineInterface): Promise<void> {
     const liveIds = new Set([link.sessionId, ...peers.map(peer => peer.sessionId)])
     const past = await readHistory($, now, liveIds)
     if (JSON.stringify(past) !== JSON.stringify(await read($, history))) await update($, history, () => past)
+    const reports = await readFindings($, now)
+    if (JSON.stringify(reports) !== JSON.stringify(await read($, findings))) await update($, findings, () => reports)
   }
+  // The cache's clock and the limits' countdowns move with time alone: a redraw a minute.
+  if (link.ticks % REDRAW_EVERY === 0) $.ui.invalidate('ui.render')
   link.ticks += 1
 }
 
@@ -509,14 +621,79 @@ function detailLine(task: string, info: BoardInfo, project: string): string {
   return [purpose, now, files ? `dosyalar: ${files}` : ''].filter(Boolean).join(' · ')
 }
 
-// What the model reads beside a prompt: the board, only when it changed since.
+// What the model reads after it changes a file: the board, only when it changed since
+// the model last read it. A turn that only reads or talks is told nothing.
 async function freshNote($: EngineInterface): Promise<string | null> {
   const held = await read($, live)
-  const note = boardNote(held.slot === null ? '' : `#${held.slot + 1}`, await read($, board), held.peers, await read($, history), await $.clock.now())
-  if (!note || note === lastNote) return null
-  lastNote = note
+  const label = held.slot === null ? '' : `#${held.slot + 1}`
+  const now = await $.clock.now()
+  const info = await read($, board)
+  const past = await read($, history)
+  // Compared without the how-to line, which is said once and is no change of the board.
+  const bare = boardNote(label, info, held.peers, past, now, false)
+  if (!bare || bare === lastNote) return null
+  lastNote = bare
+  const note = howToSaid ? bare : boardNote(label, info, held.peers, past, now, true)
+  howToSaid = true
 
   return note
+}
+
+// The conversation was summarized: what the model had read of the board is gone.
+function forgetNotes(): void {
+  lastNote = ''
+  howToSaid = false
+  notedAt.clear()
+}
+
+async function compactNow($: EngineInterface): Promise<void> {
+  const instructions = compactInstructions(await read($, board), link?.project ?? '') ?? undefined
+  try {
+    const done = await $.session.compact(instructions ? { instructions } : {})
+    if ('skip' in done && typeof done.skip === 'string') {
+      void $.ui.toast(`Sıkıştırılmadı: ${done.skip}`)
+
+      return
+    }
+    forgetNotes()
+    compactHinted = false
+    await note($, 'Pano', 'sohbet pano özetiyle sıkıştırıldı')
+    void $.ui.toast('Sohbet pano özetiyle sıkıştırıldı.')
+  } catch (error) {
+    const busy = (await read($, workers)).find(worker => worker.id === 'main')?.status === 'working'
+    void $.ui.toast(
+      busy
+        ? 'Şef çalışırken sıkıştırılamaz; iş bitince yeniden dene.'
+        : `Sıkıştırılamadı: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+async function saveDeferred($: EngineInterface, value: string): Promise<void> {
+  const names = [...new Set(value.split(/[\s,;]+/).map(name => name.trim()).filter(Boolean))]
+  const refused = names.filter(name => NEVER_DEFERRED.has(name))
+  const list = names.filter(name => !NEVER_DEFERRED.has(name))
+  await update($, rounds, r => ({ ...r, defer: r.defer + 1 }))
+  await $.store.set(STORE_DEFERRED, list)
+  await update($, deferred, () => list)
+  const not = refused.length > 0 ? ` (${refused.join(', ')} ertelenemez)` : ''
+  void $.ui.toast(
+    list.length > 0
+      ? `Yeni sohbetlerde ertelenecek: ${list.join(', ')}${not}. Bu sohbet önbelleği bozulmasın diye değişmez.`
+      : `Erteleme listesi boşaltıldı${not}; yeni sohbetlerde bütün araçlar önde.`,
+  )
+}
+
+async function storedList($: EngineInterface): Promise<string[]> {
+  const value = await $.store.get(STORE_DEFERRED).catch(() => undefined)
+
+  return Array.isArray(value) ? value.filter((name): name is string => typeof name === 'string' && !NEVER_DEFERRED.has(name)) : []
+}
+
+function cacheGauge(stats: { lastResponseAt: number | null; last: Parameters<typeof hitPercent>[0] }, ttl: number | null, now: number): CacheGauge {
+  const heat = warmth(stats.lastResponseAt, ttl, now)
+
+  return { state: heat.state, text: warmthText(heat), hit: hitPercent(stats.last) }
 }
 
 const editedPath = (input: unknown): string | null => {
@@ -524,6 +701,52 @@ const editedPath = (input: unknown): string | null => {
   const path = fields.file_path ?? fields.notebook_path
 
   return typeof path === 'string' && path ? path : null
+}
+
+type TurnUsageLike = Parameters<typeof fromUsage>[0]
+
+// A main-loop turn's tokens: the counters, the cache lifetime a long pause reveals,
+// and the fixed load every request carries, estimated locally (no request is sent).
+async function countTurn($: EngineInterface, agentId: string | undefined, used: TurnUsageLike | undefined): Promise<void> {
+  if (agentId !== undefined || !used) return
+  const turn = fromUsage(used)
+  const now = await $.clock.now()
+  const before = (await read($, tokens)).lastResponseAt
+  if (before !== null && turnStartedAt > before) {
+    const ttl = learnTtl(turnStartedAt - before, contextAtStart, turn)
+    if (ttl !== null && ttl !== (await read($, cacheTtl))) {
+      await update($, cacheTtl, () => ttl)
+      await $.store.set(STORE_TTL, ttl)
+    }
+  }
+  await update($, tokens, stats => withTurn(stats, turn, now))
+  const measured = await $.session.usage({ breakdown: 'summary' })
+  const breakdown = measured.context.breakdown
+  if (breakdown) await update($, load, () => fixedLoad(breakdown, now))
+  const percent = measured.context.percent ?? 0
+  if (percent >= COMPACT_HINT_PERCENT && !compactHinted) {
+    compactHinted = true
+    void $.ui.toast(`Bağlam %${percent}: Piksel Ofis panelinden pano özetiyle sıkıştırabilirsin.`)
+  }
+}
+
+// The refusal for an Agent call another chat's recent report already answers, once
+// per report and brief; null lets the subagent start.
+async function agentHeld($: EngineInterface, input: unknown): Promise<string | null> {
+  if (!link) return null
+  const fields = input as { description?: unknown; prompt?: unknown; subagent_type?: unknown }
+  if (fields.subagent_type === 'fork') return null
+  const description = typeof fields.description === 'string' ? fields.description : ''
+  const prompt = typeof fields.prompt === 'string' ? fields.prompt : ''
+  const now = await $.clock.now()
+  const found = matchingFinding(`${description} ${prompt}`, link.project, await readFindings($, now), now)
+  if (!found) return null
+  const key = `${found.id}|${description}`
+  if (heldAgents.has(key)) return null
+  heldAgents.add(key)
+  await note($, 'Pano', `alt ajan yerine ${found.label || 'başka sohbet'} raporu önerildi: ${clip(found.description, 30)}`)
+
+  return findingText(found, now)
 }
 
 async function sendToChat($: EngineInterface, to: string, text: string): Promise<string> {
@@ -548,6 +771,10 @@ export const register: Register = on => {
     await $.command.register({ name: 'ofis', description: 'Piksel Ofis panelini aç' })
     const now = await $.session.usage()
     await update($, usage, () => toUsage(now.context, now.rateLimits, now.cost))
+    const storedDefer = await storedList($)
+    await update($, deferred, () => storedDefer)
+    const storedTtl = await $.store.get(STORE_TTL).catch(() => undefined)
+    if (typeof storedTtl === 'number') await update($, cacheTtl, () => storedTtl)
     void $.ui.open({ id: PANE, title: TITLE })
     await $.tool
       .register({
@@ -602,7 +829,13 @@ export const register: Register = on => {
       // The next conversation of this process is another chat: a board of its own.
       await update($, board, () => EMPTY_BOARD)
       await update($, live, held => ({ ...held, slot: null }))
-      lastNote = ''
+      await update($, tokens, () => EMPTY_TOKENS)
+      await update($, load, () => null)
+      forgetNotes()
+      heldWrites.clear()
+      heldAgents.clear()
+      briefs.clear()
+      compactHinted = false
       if (link) link.startedAt = await $.clock.now()
     } else {
       timer?.cancel()
@@ -629,6 +862,8 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       // A new request for the main session: the finished helpers go home.
       const task = clip(headline(e.text), 60)
+      turnStartedAt = at
+      contextAtStart = (await read($, usage))?.contextTokens ?? null
       await update($, workers, list =>
         list
           .filter(worker => worker.id === 'main' || worker.status === 'working')
@@ -649,6 +884,8 @@ export const register: Register = on => {
 
   on('agent.spawn', async ($, e, next) => {
     const started = await next(e)
+    // A fork carries this chat's own context: its answer is no research for the others.
+    if (started.agentId && !e.fork) briefs.set(started.agentId, { type: e.subagentType, description: e.description, prompt: e.prompt })
     if (started.agentId) await hireHelper($, e.subagentType, e.description, started.agentId).catch(
       (error: unknown) => $.ui.log(`Ofis güncellenemedi: ${error instanceof Error ? error.message : String(error)}`),
     )
@@ -666,35 +903,77 @@ export const register: Register = on => {
       (error: unknown) => $.ui.log(`Ofis güncellenemedi: ${error instanceof Error ? error.message : String(error)}`),
     )
 
+    // Research another chat already had done: offered once before a subagent starts.
+    if (tool === 'Agent') {
+      const held = await agentHeld($, e).catch(() => null)
+      if (held) return { deny: held }
+    }
+
     // The board's guard: a file changed lately by another chat is not overwritten
     // blind, and every file this chat changes goes on its board entry.
     const path = EDIT_TOOLS.has(tool) ? editedPath(e) : null
-    if (!path) return next(e)
     const now = at
-    const held = await read($, live)
-    const conflicts = conflictsFor(path, held.peers, await read($, history), now)
-    const key = pathKey(path)
-    // Held back once per file: the model reads what is there now, then writes again.
-    if (tool === 'Write' && conflicts.length > 0 && !heldWrites.has(key)) {
+    const held = path ? await read($, live) : null
+    const conflicts = path && held ? conflictsFor(path, held.peers, await read($, history), now) : []
+    const key = path ? pathKey(path) : ''
+    // Held back once per file: the model is shown what changed and asked to Edit.
+    if (path && tool === 'Write' && conflicts.length > 0 && !heldWrites.has(key)) {
       heldWrites.add(key)
       await note($, 'Pano', `üzerine yazma durduruldu: ${conflicts.map(one => one.label).join(', ')} bu dosyayı değiştirdi`)
 
-      return {
-        deny: `${conflictText(conflicts, now)} Dosyanın güncel hâlini Read ile oku, onların değişikliğini koruyarak yaz ve Write'ı yeniden çağır.`,
-      }
+      return { deny: heldWriteText(conflicts, await fileDiff($, path), now) }
     }
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError) return ran
+    // How much of the context the result takes: the main loop's alone fills this chat's.
+    if (e.agentId === undefined && typeof ran.text === 'string') {
+      const output = { tool, label: callLabel(tool, e), chars: ran.text.length, at: now }
+      await update($, tokens, stats => withOutput(stats, output)).catch(() => undefined)
+    }
+    if (!path) return ran
     await changeBoard($, info => ({ ...info, files: withFile(info.files, { path, at: now, tool }) })).catch((error: unknown) =>
       $.ui.log(`Pano güncellenemedi: ${error instanceof Error ? error.message : String(error)}`),
     )
+    const extra: string[] = []
+    // The board, when the model first changes a file after it changed: not with
+    // every prompt, so a turn that only reads or talks is not charged for it.
+    if (e.agentId === undefined) {
+      const board = await freshNote($).catch(() => null)
+      if (board) extra.push(board)
+    }
     if (conflicts.length > 0 && now - (notedAt.get(key) ?? -Infinity) >= CONFLICT_NOTE_MS) {
       notedAt.set(key, now)
-
-      return { ...ran, context: [...(ran.context ?? []), conflictText(conflicts, now)] }
+      extra.push(conflictText(conflicts, now))
     }
 
-    return ran
+    return extra.length > 0 ? { ...ran, context: [...(ran.context ?? []), ...extra] } : ran
+  })
+
+  // A changed placement goes out in new threads only: the store is read for each, and
+  // nothing invalidates a description a thread has already sent.
+  on('tool.describe', async ($, e, next) => {
+    const told = await next(e)
+    const wanted = !NEVER_DEFERRED.has(e.tool) && (await storedList($)).includes(e.tool)
+    const isDeferred = wanted || told.isDeferred === true || (told.isDeferred === undefined && e.isDeferred === true)
+    const size: ToolSize = { tool: e.tool, tokens: approxTokens(told.description.length), isDeferred }
+    await update($, toolSizes, list => [size, ...list.filter(one => one.tool !== e.tool)]).catch(() => undefined)
+
+    return wanted ? { ...told, isDeferred: true } : told
+  })
+
+  // Every compaction of the main conversation, the engine's own included, is told
+  // what the board knows, so its summary keeps the chat's purpose and files.
+  on('session.compact', async ($, e, next) => {
+    if (e.agentId !== undefined) return next(e)
+    // The pane's own compaction carries them already.
+    const told = e.instructions?.includes(COMPACT_MARK) ? null : compactInstructions(await read($, board), link?.project ?? '')
+    const done = await next(told ? { ...e, instructions: [e.instructions, told].filter(Boolean).join('\n\n') } : e)
+    if (e.trigger !== 'precompute' && !('skip' in done && typeof done.skip === 'string')) {
+      forgetNotes()
+      compactHinted = false
+    }
+
+    return done
   })
 
   on('tool.call', { tool: MESSAGE_TOOL }, async ($, e) => {
@@ -706,18 +985,17 @@ export const register: Register = on => {
     return { result: await sendToChat($, to, text) }
   })
 
-  // Beside each prompt, while other chats work here, the board as it stands:
-  // only when it changed since the model last read it.
-  on('prompt.submit', async ($, e, next) => {
-    if (e.command) return next(e)
-    const board = await freshNote($).catch(() => null)
-
-    return board ? next({ ...e, context: [...(e.context ?? []), board] }) : next(e)
-  })
-
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId ?? 'main'
     const failed = e.reason === 'error' || e.reason === 'refusal'
+    await countTurn($, e.agentId, e.usage).catch((error: unknown) =>
+      $.ui.log(`Token sayacı güncellenemedi: ${error instanceof Error ? error.message : String(error)}`),
+    )
+    if (e.agentId !== undefined && !failed && !e.isAborted && e.answer.trim().length >= MIN_FINDING_CHARS) {
+      await saveFinding($, e.agentId, e.answer).catch((error: unknown) =>
+        $.ui.log(`Keşif kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`),
+      )
+    }
     let who = ''
     let tools = 0
     await touch($, id, worker => {
@@ -751,8 +1029,27 @@ export const register: Register = on => {
     const fillable = await read($, canFill)
     const info = await read($, board)
     const past = await read($, history)
+    const spent = await read($, tokens)
+    const fixed = await read($, load)
+    const reports = await read($, findings)
+    const later = await read($, deferred)
+    const sizes = await read($, toolSizes)
+    const ttl = await read($, cacheTtl)
     const now = await $.clock.now()
     const teams = teamsOf(team, info, held)
+    const gauge = cacheGauge(spent, ttl, now)
+    const last = spent.last
+    const heavy = spent.heavy.map(one => `${one.tool}${one.label ? ` ${one.label}` : ''} ≈${kilo(approxTokens(one.chars))}`)
+    const byTool = Object.entries(spent.byTool)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4)
+      .map(([tool, chars]) => `${tool} ≈${kilo(approxTokens(chars))}`)
+    const front = sizes
+      .filter(one => !one.isDeferred)
+      .sort((a, b) => b.tokens - a.tokens)
+      .slice(0, 6)
+      .map(one => `${one.tool} ≈${kilo(one.tokens)}`)
+    const percent = meters?.contextPercent ?? 0
 
     const rename = (value: string): void => {
       const name = value.trim().slice(0, 60)
@@ -778,9 +1075,9 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={1}>
         {Svg ? (
-          <Svg source={officeSvg(teams, meters, now)} alt={officeAlt(teams, meters)} />
+          <Svg source={officeSvg(teams, meters, now, gauge)} alt={officeAlt(teams, meters, gauge)} />
         ) : (
-          <Text dimColor>{officeAlt(teams, meters)}</Text>
+          <Text dimColor>{officeAlt(teams, meters, gauge)}</Text>
         )}
         <Box flexDirection="column">
           <Text weight="semibold">
@@ -817,6 +1114,70 @@ export const register: Register = on => {
               placeholder={`Bu sohbete ad ver (şimdi: ${titleOf(info)})`}
               submitLabel="Kaydet"
               onSubmit={rename}
+            />
+          )}
+          {reports.length > 0 && <Text dimColor>Diğer sohbetlerin keşifleri (alt ajan yeniden başlatılmadan önce önerilir):</Text>}
+          {reports.slice(0, 4).map(one => (
+            <Text dimColor wrap="truncate-end">
+              {one.label || '—'} · {one.type} · {ago(one.at, now)} · {one.description}
+            </Text>
+          ))}
+        </Box>
+        <Box flexDirection="column">
+          <Text weight="semibold">Token</Text>
+          <Text dimColor wrap="truncate-end">
+            {last
+              ? `Son tur: girdi ${kilo(last.input)} · önbellekten ${kilo(last.cacheRead)} · önbelleğe yazılan ${kilo(last.cacheWrite)} · çıktı ${kilo(last.output)}`
+              : 'Son tur: ilk yanıttan sonra görünür'}
+          </Text>
+          <Text dimColor wrap="truncate-end">
+            Önbellek: {gauge.text}
+            {gauge.hit === null ? '' : ` · isabet %${gauge.hit}`}
+            {spent.turns > 0 ? ` · oturum: ${spent.turns} tur, çıktı ${kilo(spent.total.output)}` : ''}
+          </Text>
+          {heavy.length > 0 && (
+            <Text dimColor wrap="truncate-end">
+              En ağır araç çıktıları: {heavy.join(' · ')}
+            </Text>
+          )}
+          {byTool.length > 0 && (
+            <Text dimColor wrap="truncate-end">
+              Araca göre çıktı: {byTool.join(' · ')}
+            </Text>
+          )}
+          {fixed && fixed.rows.length > 0 && (
+            <Text dimColor wrap="truncate-end">
+              Sabit yük (her istekte): {fixed.rows.slice(0, 5).map(row => `${row.name} ${kilo(row.tokens)}`).join(' · ')}
+            </Text>
+          )}
+          {fixed && fixed.memory.length > 0 && (
+            <Text dimColor wrap="truncate-end">
+              En büyük bellek dosyaları: {fixed.memory.map(row => `${row.name} ${kilo(row.tokens)}`).join(' · ')}
+            </Text>
+          )}
+          {percent >= COMPACT_OFFER_PERCENT && (
+            <Box flexDirection="row" flexWrap="wrap" gap={1}>
+              <Button key="sikistir" onPress={() => void compactNow($)}>
+                Pano özetiyle sıkıştır (bağlam %{percent})
+              </Button>
+            </Box>
+          )}
+          {front.length > 0 && (
+            <Text dimColor wrap="truncate-end">
+              Öndeki en büyük araç açıklamaları: {front.join(' · ')}
+            </Text>
+          )}
+          <Text dimColor wrap="truncate-end">
+            Ertelenen araçlar (yeni sohbetlerde ToolSearch arkasında): {later.length > 0 ? later.join(', ') : 'yok'}
+          </Text>
+          {Input && (
+            <Input
+              key={`ertele-${round.defer}`}
+              placeholder="Ertelenecek araç adları, virgülle (boş Enter: listeyi boşalt)"
+              submitLabel="Kaydet"
+              onSubmit={value => {
+                void saveDeferred($, value)
+              }}
             />
           )}
         </Box>

@@ -52,7 +52,45 @@ export type Chronicle = BoardInfo & {
 export type Attachment = { path: string; name: string }
 
 // Bumped to give a text field a new key, which draws it empty.
-export type Rounds = { task: number; attach: number; name: number }
+export type Rounds = { task: number; attach: number; name: number; defer: number }
+
+// A turn's tokens as the API counted them.
+export type TurnTokens = { input: number; cacheRead: number; cacheWrite: number; output: number }
+
+// A tool result that took much of the context: what it was and its size in characters.
+export type HeavyOutput = { tool: string; label: string; chars: number; at: number }
+
+// What this chat spent: the last turn, the whole session, the heaviest tool results,
+// and when the main loop last heard from the model (the prompt cache's clock).
+export type TokenStats = {
+  last: TurnTokens | null
+  total: TurnTokens
+  turns: number
+  heavy: HeavyOutput[]
+  byTool: Record<string, number>
+  lastResponseAt: number | null
+}
+
+// What every request carries before the conversation itself: the context breakdown's
+// rows and the largest memory files, as estimated tokens.
+export type LoadRow = { name: string; tokens: number }
+export type FixedLoad = { rows: LoadRow[]; memory: LoadRow[]; measuredAt: number }
+
+// A subagent's report kept for the other chats, so they need not research it again.
+export type Finding = {
+  id: string
+  sessionId: string
+  label: string
+  project: string
+  type: string
+  description: string
+  prompt: string
+  summary: string
+  at: number
+}
+
+// A tool the model sees in the prompt's list, and the size of its description.
+export type ToolSize = { tool: string; tokens: number; isDeferred: boolean }
 
 // One team in the drawing: this chat's or a peer's.
 export type Team = {
@@ -77,6 +115,12 @@ declare module 'claude-code' {
       attachments: Shaped<Attachment[]>
       rounds: Shaped<Rounds>
       canFill: Shaped<boolean>
+      tokens: Shaped<TokenStats>
+      load: Shaped<FixedLoad | null>
+      findings: Shaped<Finding[]>
+      deferred: Shaped<string[]>
+      toolSizes: Shaped<ToolSize[]>
+      cacheTtl: Shaped<number | null>
     }
   }
 }

@@ -1,8 +1,11 @@
 import type { Station, Team, Usage, Worker } from '../types'
 
-// The office is drawn on a 320x232 grid: the room on 0..180, the meters below.
+// The prompt cache as the HUD shows it: how warm, in words, and the last turn's hit.
+export type CacheGauge = { state: 'unknown' | 'warm' | 'cooling' | 'cold'; text: string; hit: number | null }
+
+// The office is drawn on a 320x254 grid: the room on 0..180, the meters below.
 const W = 320
-const H = 232
+const H = 254
 
 type Point = { x: number; y: number }
 
@@ -185,7 +188,7 @@ function corkBoard(teams: Team[]): string {
   return out
 }
 
-function room(teams: Team[]): string {
+function room(teams: Team[], cache: CacheGauge | null): string {
   let out = ''
   // Wall and floor.
   out += r(0, 0, W, 56, '#3b2f4a')
@@ -251,7 +254,11 @@ function room(teams: Team[]): string {
   // Coffee corner.
   out += r(262, 140, 52, 6, '#8b5a2b') + r(264, 146, 48, 22, '#74491f')
   out += r(270, 120, 18, 20, '#2b2f36') + r(272, 123, 14, 6, '#5a5f68') + r(276, 133, 6, 7, '#f4ead5')
-  out += r(277, 116, 2, 3, '#ffffff', 'steam') + r(281, 114, 2, 3, '#ffffff', 'steam')
+  // The coffee steams while the prompt cache is warm, and goes cold with it.
+  const heat = cache?.state ?? 'unknown'
+  if (heat === 'warm' || heat === 'unknown') out += r(277, 116, 2, 3, '#ffffff', 'steam') + r(281, 114, 2, 3, '#ffffff', 'steam')
+  else if (heat === 'cooling') out += r(279, 115, 2, 3, '#cfd6dd', 'steam')
+  else out += r(276, 133, 6, 2, '#6b8fa8')
   out += r(296, 134, 6, 6, '#e05a7a') + r(304, 135, 6, 5, '#4a90d9')
   out += label(288, 176, 'KAFE')
 
@@ -305,8 +312,10 @@ function meter(y: number, name: string, percent: number | null, note: string): s
   return out
 }
 
-function hud(usage: Usage | null, now: number, active: number, chats: number): string {
-  let out = r(0, 180, W, 52, '#1d1a26') + r(0, 180, W, 2, '#5c4b7a')
+const HEAT_COLORS: Record<CacheGauge['state'], string> = { unknown: '#9a8fb0', warm: '#58f087', cooling: '#f0c419', cold: '#6bb8ff' }
+
+function hud(usage: Usage | null, now: number, active: number, chats: number, cache: CacheGauge | null): string {
+  let out = r(0, 180, W, H - 180, '#1d1a26') + r(0, 180, W, 2, '#5c4b7a')
   let y = 186
   const limits = usage?.limits ?? []
   if (limits.length === 0) {
@@ -321,9 +330,16 @@ function hud(usage: Usage | null, now: number, active: number, chats: number): s
   const contextNote = tokens ? `${Math.round(tokens / 1000)}k/${Math.round((usage?.contextWindow ?? 0) / 1000)}k` : ''
   out += meter(y, 'BAĞLAM', usage?.contextPercent ?? null, contextNote)
   y += 11
+  if (cache) {
+    const hit = cache.hit === null ? '' : `  ·  İSABET %${cache.hit}`
+    out += label(6, y + 5.5, 'ÖNBELLEK', 6, '#e8dcc0', 'start')
+    out += r(64, y, 7, 7, HEAT_COLORS[cache.state])
+    out += label(76, y + 5.5, `${cache.text}${hit}`, 5.5, HEAT_COLORS[cache.state], 'start')
+    y += 11
+  }
   const cost = usage?.usd !== null && usage?.usd !== undefined ? `MALİYET $${usage.usd.toFixed(2)}` : 'MALİYET --'
   const chatNote = chats > 1 ? `   ·   SOHBET: ${chats}` : ''
-  out += label(6, Math.min(y + 5.5, 229), `${cost}   ·   EKİP: ${active} çalışıyor${chatNote}`, 6, '#e8dcc0', 'start')
+  out += label(6, Math.min(y + 5.5, H - 3), `${cost}   ·   EKİP: ${active} çalışıyor${chatNote}`, 6, '#e8dcc0', 'start')
 
   return out
 }
@@ -331,7 +347,7 @@ function hud(usage: Usage | null, now: number, active: number, chats: number): s
 // A peer's people carry their chat's label, so two chats' chiefs are told apart.
 const shownName = (team: Team, worker: Worker): string => (team.isSelf ? worker.name : `${worker.name}${team.label}`)
 
-export function officeSvg(teams: Team[], usage: Usage | null, now: number): string {
+export function officeSvg(teams: Team[], usage: Usage | null, now: number, cache: CacheGauge | null = null): string {
   type Placed = { worker: Worker; name: string; at: Point; look: Look; slot: number; badge: string | null }
   const placed: Placed[] = []
   const used: Record<Station, number> = { desk: 0, shelf: 0, terminal: 0, web: 0, board: 0, coffee: 0 }
@@ -382,21 +398,22 @@ export function officeSvg(teams: Team[], usage: Usage | null, now: number): stri
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W * 2}" height="${H * 2}" shape-rendering="crispEdges">` +
     STYLE +
-    room(teams) +
+    room(teams, cache) +
     seated.map(draw).join('') +
     desks(busyDesks) +
     standing.map(draw).join('') +
     tags +
-    hud(usage, now, active, teams.length) +
+    hud(usage, now, active, teams.length, cache) +
     '</svg>'
   )
 }
 
-export function officeAlt(teams: Team[], usage: Usage | null): string {
+export function officeAlt(teams: Team[], usage: Usage | null, cache: CacheGauge | null = null): string {
   const people = (team: Team): string => team.workers.map(worker => `${shownName(team, worker)}: ${bubbleText(worker)}`).join(', ')
   const own = teams.filter(team => team.isSelf).map(people).join(', ')
   const others = teams.filter(team => !team.isSelf).map(people).join(', ')
   const limits = (usage?.limits ?? []).map(limit => `${LIMIT_NAMES[limit.kind] ?? limit.kind} %${limit.percentUsed}`).join(', ')
+  const warm = cache ? ` Önbellek: ${cache.text}${cache.hit === null ? '' : `, isabet %${cache.hit}`}.` : ''
 
-  return `Piksel ofis. ${own}.${others ? ` Diğer sohbetler: ${others}.` : ''}${limits ? ` Limitler: ${limits}.` : ''}`
+  return `Piksel ofis. ${own}.${others ? ` Diğer sohbetler: ${others}.` : ''}${limits ? ` Limitler: ${limits}.` : ''}${warm}`
 }
