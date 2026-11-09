@@ -1,9 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionContextUsage, SessionCost, SessionRateLimit, Timer } from 'claude-code'
 
-import type { Attachment, BoardInfo, Chronicle, Finding, Live, LogEntry, Peer, Station, Team, ToolSize, Usage, Worker } from '../types'
+import type { BoardInfo, Chronicle, Finding, Live, Peer, Station, Team, Usage, Worker } from '../types'
 import {
-  ago,
   boardNote,
   clipDiff,
   COMPACT_MARK,
@@ -11,7 +10,6 @@ import {
   conflictsFor,
   conflictText,
   EMPTY_BOARD,
-  filesLine,
   FINDING_SUMMARY,
   FINDING_WINDOW_MS,
   findingText,
@@ -20,27 +18,14 @@ import {
   parseChronicle,
   parseFindings,
   pathKey,
-  statusWord,
   titleOf,
+  transcriptTitle,
   withFile,
   withTask,
 } from './board'
-import { officeAlt, officeSvg } from './scene'
+import { LEAVE_AFTER_MS, officeAlt, officeSvg } from './scene'
 import type { CacheGauge } from './scene'
-import {
-  approxTokens,
-  callLabel,
-  EMPTY_TOKENS,
-  fixedLoad,
-  fromUsage,
-  hitPercent,
-  kilo,
-  learnTtl,
-  warmth,
-  warmthText,
-  withOutput,
-  withTurn,
-} from './tokens'
+import { EMPTY_TOKENS, fromUsage, hitPercent, learnTtl, warmth, warmthText, withTurn } from './tokens'
 
 const PANE = 'pixel-ofis'
 const TITLE = 'Piksel Ofis'
@@ -60,23 +45,18 @@ const MAIN: Worker = {
 // Change a tag when that value's fields change: an earlier version's value
 // outlives a reload and is then read as the initial one.
 const workers = atom({ plugin: 'pixel-ofis', key: 'workers' } as const, [MAIN], { shape: 'workers-1' })
-const log = atom({ plugin: 'pixel-ofis', key: 'log' } as const, [], { shape: 'log-1' })
 const usage = atom({ plugin: 'pixel-ofis', key: 'usage' } as const, null, { shape: 'usage-1' })
-const live = atom({ plugin: 'pixel-ofis', key: 'live' } as const, { slot: null, peers: [] }, { shape: 'live-2' })
+const live = atom({ plugin: 'pixel-ofis', key: 'live' } as const, { slot: null, peers: [] }, { shape: 'live-3' })
 const board = atom({ plugin: 'pixel-ofis', key: 'board' } as const, EMPTY_BOARD, { shape: 'board-1' })
 const history = atom({ plugin: 'pixel-ofis', key: 'history' } as const, [], { shape: 'history-1' })
-const attachments = atom({ plugin: 'pixel-ofis', key: 'attachments' } as const, [], { shape: 'attachments-1' })
-const rounds = atom({ plugin: 'pixel-ofis', key: 'rounds' } as const, { task: 0, attach: 0, name: 0, defer: 0 }, { shape: 'rounds-3' })
-const canFill = atom({ plugin: 'pixel-ofis', key: 'canFill' } as const, true, { shape: 'can-fill-1' })
-const tokens = atom({ plugin: 'pixel-ofis', key: 'tokens' } as const, EMPTY_TOKENS, { shape: 'tokens-1' })
-const load = atom({ plugin: 'pixel-ofis', key: 'load' } as const, null, { shape: 'load-1' })
-const findings = atom({ plugin: 'pixel-ofis', key: 'findings' } as const, [], { shape: 'findings-1' })
-const deferred = atom({ plugin: 'pixel-ofis', key: 'deferred' } as const, [], { shape: 'deferred-1' })
-const toolSizes = atom({ plugin: 'pixel-ofis', key: 'toolSizes' } as const, [], { shape: 'tool-sizes-1' })
+const tokens = atom({ plugin: 'pixel-ofis', key: 'tokens' } as const, EMPTY_TOKENS, { shape: 'tokens-2' })
 const cacheTtl = atom({ plugin: 'pixel-ofis', key: 'cacheTtl' } as const, null, { shape: 'cache-ttl-1' })
+// When this chat's main loop last started or finished a turn: how long it has waited.
+const activeAt = atom({ plugin: 'pixel-ofis', key: 'activeAt' } as const, 0, { shape: 'active-at-1' })
+// A newer version of the mod on disk than this chat runs: what the pane warns of.
+const newer = atom({ plugin: 'pixel-ofis', key: 'newer' } as const, null, { shape: 'newer-1' })
 
 // Kept across sessions in the plugin's store.
-const STORE_DEFERRED = 'deferredTools'
 const STORE_TTL = 'cacheTtlMs'
 // The pane offers a compaction from this share of the context window on.
 const COMPACT_OFFER_PERCENT = 60
@@ -86,8 +66,6 @@ const COMPACT_HINT_PERCENT = 70
 const MIN_FINDING_CHARS = 200
 const FINDINGS_KEPT = 10
 const FINDINGS_SHOWN = 12
-// ToolSearch loads the deferred tools: it can never wait behind itself.
-const NEVER_DEFERRED = new Set(['ToolSearch'])
 
 // Every chat writes its team to a slot file of one folder and reads the others':
 // a fixed pool, so nothing has to be deleted when a chat goes away.
@@ -95,8 +73,6 @@ const SLOT_COUNT = 12
 const TICK_MS = 3000
 const HEARTBEAT_MS = 10000
 const STALE_MS = 45000
-const MAX_ATTACHMENTS = 8
-const RESEND_GUARD_MS = 15000
 // The journal folder is read every tenth tick: ended chats change seldom.
 const HISTORY_EVERY = 10
 const REDRAW_EVERY = 20
@@ -110,12 +86,21 @@ const MESSAGE_TOOL = 'mcp__pixel-ofis__ofis_mesaj'
 
 const TEAM_COLORS = ['#4fd1ff', '#ff7ab6', '#9dff6a', '#ffb347', '#c39bff', '#ff6b6b']
 const SELF_COLOR = '#ffd700'
-const IMAGE = /\.(png|jpe?g|gif|webp|bmp)$/i
 
-type Snapshot = BoardInfo & { sessionId: string; project: string; task: string; workers: Worker[]; updatedAt: number; ended?: true }
+type Snapshot = BoardInfo & {
+  sessionId: string
+  project: string
+  task: string
+  workers: Worker[]
+  activeAt?: number
+  updatedAt: number
+  ended?: true
+}
 
 type Link = {
   dir: string
+  configDir: string
+  cwd: string
   sessionId: string
   project: string
   startedAt: number
@@ -124,13 +109,16 @@ type Link = {
   lastJournal: string
   ticks: number
   failed: boolean
+  // The session's transcript, once found; whether the projects folder was searched.
+  transcript: string | null
+  searched: boolean
 }
 
 // Module values start over on a reload, when `session.start` sets them again.
 let link: Link | null = null
+// The version this chat loaded, from the manifest as it stood at the load.
+let loadedVersion: string | null = null
 let timer: Timer | null = null
-let draft = ''
-let lastSent = { text: '', at: 0 }
 // The board note the model last read, so an unchanged board costs no tokens again,
 // and whether it was told how to message another chat in this conversation.
 let lastNote = ''
@@ -201,6 +189,8 @@ const headline = (text: string): string => text.split(/\r?\n/).find(line => line
 
 const baseName = (path: string): string => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? path
 
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error))
+
 function toUsage(context: SessionContextUsage, rateLimits: SessionRateLimit[], cost: SessionCost | undefined): Usage {
   return {
     contextPercent: context.percent ?? null,
@@ -209,11 +199,6 @@ function toUsage(context: SessionContextUsage, rateLimits: SessionRateLimit[], c
     limits: rateLimits.map(limit => ({ kind: limit.kind, percentUsed: limit.percentUsed, resetsAt: limit.resetsAt ?? null })),
     usd: cost?.usd ?? null,
   }
-}
-
-async function note($: EngineInterface, who: string, text: string): Promise<void> {
-  const at = await $.clock.now()
-  await update($, log, list => [...list, { at, who, text } satisfies LogEntry].slice(-6))
 }
 
 async function nameFor($: EngineInterface, role: string): Promise<string> {
@@ -247,7 +232,6 @@ async function hireHelper($: EngineInterface, role: string, description: string,
     startedAt: at,
   }
   await touch($, agentId, worker => ({ ...worker, name, role, task: hire.task }), hire)
-  await note($, name, `işe başladı: ${clip(description, 40)}`)
 }
 
 // ---- Other chats: the shared live folder -------------------------------------------
@@ -289,10 +273,10 @@ async function writeJournal($: EngineInterface, ended = false): Promise<void> {
 
 async function changeBoard($: EngineInterface, change: (info: BoardInfo) => BoardInfo): Promise<void> {
   await update($, board, change)
-  await writeJournal($).catch((error: unknown) => $.ui.log(`Pano günlüğü yazılamadı: ${error instanceof Error ? error.message : String(error)}`))
+  await writeJournal($).catch((error: unknown) => $.ui.log(`Pano günlüğü yazılamadı: ${errorText(error)}`))
 }
 
-// Ended or silent chats of the last day, newest first: the board's history.
+// Ended or silent chats of the last day, newest first: what the board guards remember.
 async function readHistory($: EngineInterface, now: number, liveIds: Set<string>): Promise<Chronicle[]> {
   if (!link) return []
   const dir = journalDir(link.dir)
@@ -388,6 +372,7 @@ async function writeSlot($: EngineInterface, slot: number, now: number, ended: b
     project: link.project,
     task: team.find(worker => worker.id === 'main')?.task ?? '',
     workers: team,
+    activeAt: await read($, activeAt),
     ...info,
     ...(ended ? { ended: true as const } : {}),
   }
@@ -407,6 +392,8 @@ async function tick($: EngineInterface): Promise<void> {
   if (sessionId !== link.sessionId) {
     link.sessionId = sessionId
     link.lastText = ''
+    link.transcript = null
+    link.searched = false
     await update($, live, held => ({ ...held, slot: null }))
   }
   const snaps = await readSlots($, link.dir)
@@ -430,7 +417,8 @@ async function tick($: EngineInterface): Promise<void> {
   snaps.forEach((snap, index) => {
     if (index === slot || !isFresh(snap, now) || snap.sessionId === link?.sessionId) return
     const { sessionId, project, task, workers: crew, name, purpose, tasks, files } = snap
-    peers.push({ sessionId, slot: index, project, task, workers: crew, name, purpose, tasks, files })
+    const peer: Peer = { sessionId, slot: index, project, task, workers: crew, name, purpose, tasks, files }
+    peers.push(typeof snap.activeAt === 'number' ? { ...peer, activeAt: snap.activeAt } : peer)
   })
   const next: Live = { slot, peers }
   const held = await read($, live)
@@ -442,13 +430,12 @@ async function tick($: EngineInterface): Promise<void> {
   }
 
   if (link.ticks % HISTORY_EVERY === 0) {
+    await checkVersion($)
     const liveIds = new Set([link.sessionId, ...peers.map(peer => peer.sessionId)])
     const past = await readHistory($, now, liveIds)
     if (JSON.stringify(past) !== JSON.stringify(await read($, history))) await update($, history, () => past)
-    const reports = await readFindings($, now)
-    if (JSON.stringify(reports) !== JSON.stringify(await read($, findings))) await update($, findings, () => reports)
   }
-  // The cache's clock and the limits' countdowns move with time alone: a redraw a minute.
+  // Waiting minutes, the cache's clock and the limits' countdowns move with time alone.
   if (link.ticks % REDRAW_EVERY === 0) $.ui.invalidate('ui.render')
   link.ticks += 1
 }
@@ -459,7 +446,7 @@ function startLive($: EngineInterface): void {
     void tick($).catch((error: unknown) => {
       if (link && !link.failed) {
         link.failed = true
-        $.ui.log(`Diğer sohbetler okunamadı: ${error instanceof Error ? error.message : String(error)}`)
+        $.ui.log(`Diğer sohbetler okunamadı: ${errorText(error)}`)
       }
     })
   }
@@ -467,158 +454,113 @@ function startLive($: EngineInterface): void {
   run()
 }
 
-// ---- Tasks and attachments ---------------------------------------------------------
+// ---- A newer version on disk ---------------------------------------------------------
 
-function compose(text: string, files: Attachment[]): string {
-  if (files.length === 0) return text
-  const list = files.map(file => `- ${file.path}`).join('\n')
+async function manifestVersion($: EngineInterface): Promise<string | null> {
+  const text = await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).catch(() => null)
+  if (typeof text !== 'string') return null
+  try {
+    const version = (JSON.parse(text) as { version?: unknown }).version
 
-  return `${text}\n\nEkler (Read aracıyla aç):\n${list}`
-}
-
-// A pasted path list: quoted paths ("Copy as path"), else one per line or `;`.
-function parsePaths(value: string): string[] {
-  const quoted = [...value.matchAll(/"([^"]+)"/g)].map(match => (match[1] ?? '').trim())
-  const raw = quoted.length > 0 ? quoted : value.split(/\r?\n|;/)
-
-  return raw.map(path => path.trim()).filter(Boolean)
-}
-
-async function addFiles($: EngineInterface, paths: string[]): Promise<void> {
-  const added: Attachment[] = []
-  const missing: string[] = []
-  for (const path of paths) {
-    const stat = await $.fs.stat(path).catch(() => null)
-    if (stat?.kind === 'file') added.push({ path, name: baseName(path) })
-    else missing.push(baseName(path))
+    return typeof version === 'string' ? version : null
+  } catch {
+    return null
   }
-  let dropped = 0
-  await update($, attachments, list => {
-    const merged = [...list]
-    for (const file of added) if (!merged.some(one => one.path === file.path)) merged.push(file)
-    dropped = Math.max(0, merged.length - MAX_ATTACHMENTS)
-
-    return merged.slice(0, MAX_ATTACHMENTS)
-  })
-  if (missing.length > 0) void $.ui.toast(`Dosya bulunamadı: ${missing.join(', ')}`)
-  else if (dropped > 0) void $.ui.toast(`En fazla ${MAX_ATTACHMENTS} ek eklenebilir.`)
-  else if (added.length > 0) void $.ui.toast(`${added.length} ek eklendi.`)
 }
 
-async function latestScreenshot($: EngineInterface): Promise<string | null> {
-  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
-  if (!home) return null
-  const dirs = [
-    `${home}\\Pictures\\Screenshots`,
-    `${home}\\OneDrive\\Pictures\\Screenshots`,
-    `${home}\\OneDrive\\Resimler\\Ekran Görüntüleri`,
-  ]
-  let best: { path: string; mtimeMs: number } | null = null
-  for (const dir of dirs) {
-    for (const entry of await $.fs.list(dir).catch(() => [])) {
-      if (entry.kind !== 'file' || !IMAGE.test(entry.name)) continue
-      if (!best || entry.mtimeMs > best.mtimeMs) best = { path: `${dir}\\${entry.name}`, mtimeMs: entry.mtimeMs }
+// A chat whose folder is not watched keeps the code it loaded: the pane says when the
+// disk holds another version, and what takes it in.
+async function checkVersion($: EngineInterface): Promise<void> {
+  if (!loadedVersion) return
+  const disk = await manifestVersion($)
+  const next = disk && disk !== loadedVersion ? { loaded: loadedVersion, disk } : null
+  if (JSON.stringify(next) !== JSON.stringify(await read($, newer))) await update($, newer, () => next)
+}
+
+// ---- The chat's title: the one Claude Code shows for the session --------------------
+
+// Claude Code names a project's folder after its path, every other character a dash.
+const projectFolder = (cwd: string): string => cwd.replace(/[^a-zA-Z0-9]/g, '-')
+
+async function findTranscript($: EngineInterface): Promise<string | null> {
+  if (!link) return null
+  if (link.transcript) return link.transcript
+  const projects = `${link.configDir}/projects`
+  const name = `${link.sessionId}.jsonl`
+  const guess = `${projects}/${projectFolder(link.cwd)}/${name}`
+  if (await $.fs.exists(guess).catch(() => false)) {
+    link.transcript = guess
+
+    return guess
+  }
+  // A folder named otherwise: looked for once per conversation.
+  if (link.searched) return null
+  link.searched = true
+  for (const entry of await $.fs.list(projects).catch(() => [])) {
+    if (entry.kind !== 'dir') continue
+    const path = `${projects}/${entry.name}/${name}`
+    if (await $.fs.exists(path).catch(() => false)) {
+      link.transcript = path
+
+      return path
     }
   }
 
-  return best?.path ?? null
+  return null
 }
 
-async function clearComposer($: EngineInterface): Promise<void> {
-  draft = ''
-  await update($, attachments, () => [])
-  await update($, rounds, held => ({ ...held, task: held.task + 1 }))
+// The board carries the session's title as the chat's name; a transcript too large to
+// read keeps the title it had.
+async function refreshTitle($: EngineInterface): Promise<void> {
+  const path = await findTranscript($)
+  if (!path) return
+  const text = await $.fs.read(path).catch(() => null)
+  if (typeof text !== 'string') return
+  const title = clip(transcriptTitle(text), 80)
+  if (title && title !== (await read($, board)).name) await changeBoard($, info => ({ ...info, name: title }))
 }
 
-async function sendTask($: EngineInterface, value: string): Promise<void> {
-  const text = value.trim()
-  if (!text) {
-    void $.ui.toast('Önce görevi yaz.')
+// ---- The drawing ---------------------------------------------------------------------
 
-    return
-  }
-  const now = await $.clock.now()
-  // Enter pressed again on a task already on its way would send it twice.
-  if (text === lastSent.text && now - lastSent.at < RESEND_GUARD_MS) {
-    void $.ui.toast('Bu görev az önce gönderildi.')
+// How long a chat with nobody at work has waited: null while anyone in it works,
+// Infinity for a chat that never said when it was last active.
+function waitedMs(crew: Worker[], since: number | undefined, now: number): number | null {
+  if (crew.some(worker => worker.status === 'working')) return null
+  const last = since ?? Math.max(0, ...crew.map(worker => worker.startedAt))
 
-    return
-  }
-  lastSent = { text, at: now }
-  const files = await read($, attachments)
-  const isBusy = (await read($, workers)).find(worker => worker.id === 'main')?.status === 'working'
-  await clearComposer($)
-  const extra = files.length > 0 ? ` (+${files.length} ek)` : ''
-  await note($, 'Sen', `${isBusy ? 'sıraya aldın' : 'görev verdin'}: ${clip(text, 40)}${extra}`)
-  void $.ui.toast(isBusy ? 'Görev sıraya alındı: Şef elindeki işi bitirince başlar.' : 'Görev Şef’e iletildi.')
-  void $.prompt.submit({ text: compose(text, files), asUser: true }).catch((error: unknown) => {
-    lastSent = { text: '', at: 0 }
-    void $.ui.toast(`Görev gönderilemedi: ${error instanceof Error ? error.message : String(error)}`)
-  })
+  return last > 0 ? Math.max(0, now - last) : Number.POSITIVE_INFINITY
 }
 
-async function toComposer($: EngineInterface): Promise<void> {
-  const text = draft.trim()
-  const files = await read($, attachments)
-  if (!text && files.length === 0) {
-    void $.ui.toast('Aktarılacak görev ya da ek yok.')
-
-    return
-  }
-  const filled = await $.prompt.fill({ text: compose(text, files), mode: 'replace' })
-  if (filled.isFilled) {
-    await clearComposer($)
-    void $.ui.toast('Sohbet kutusuna aktarıldı: oradan Enter ile gönder.')
-
-    return
-  }
-  if (filled.refusal === 'no_composer') await update($, canFill, () => false)
-  const why = filled.refusal === 'dialog' ? ': açık bir pencere var' : filled.refusal === 'no_composer' ? ': bu ekranda desteklenmiyor' : ''
-  void $.ui.toast(`Sohbet kutusuna aktarılamadı${why}.`)
-}
-
-function teamsOf(own: Worker[], info: BoardInfo, held: Live): Team[] {
+// This chat and the others still in the office: a chat that waited past the limit
+// has left, though its window may still be open. This chat never leaves its own pane.
+function teamsOf(own: Worker[], info: BoardInfo, held: Live, since: number, now: number): Team[] {
   const self: Team = {
     label: held.slot === null ? '' : `#${held.slot + 1}`,
     color: SELF_COLOR,
     isSelf: true,
-    title: titleOf(info),
+    title: info.name || info.purpose,
     task: own.find(worker => worker.id === 'main')?.task ?? '',
     files: info.files.length,
     workers: own,
+    waitingMs: waitedMs(own, since || now, now),
   }
-  const others = held.peers.map(
-    (peer, i): Team => ({
+  const others: Team[] = []
+  for (const peer of held.peers) {
+    const waiting = waitedMs(peer.workers, peer.activeAt, now)
+    if (waiting !== null && waiting >= LEAVE_AFTER_MS) continue
+    others.push({
       label: `#${peer.slot + 1}`,
-      color: TEAM_COLORS[i % TEAM_COLORS.length] ?? SELF_COLOR,
+      color: TEAM_COLORS[others.length % TEAM_COLORS.length] ?? SELF_COLOR,
       isSelf: false,
-      title: titleOf(peer),
+      title: peer.name || peer.purpose,
       task: peer.task,
       files: peer.files.length,
       workers: peer.workers,
-    }),
-  )
+      waitingMs: waiting,
+    })
+  }
 
   return [self, ...others]
-}
-
-function teamLine(team: Team): string {
-  const chief = team.workers.find(worker => worker.id === 'main')
-  const helpers = team.workers.filter(worker => worker.id !== 'main' && worker.status === 'working').length
-  const doing = chief?.status === 'working' && chief.tool ? `çalışıyor (${chief.tool})` : statusWord(chief?.status)
-  const crew = helpers > 0 ? `, ${helpers} yardımcı` : ''
-  const who = team.isSelf ? `${team.label} bu sohbet`.trim() : team.label
-
-  return `${who} · ${doing}${crew} · ${team.title}`
-}
-
-// The second line of a chat's board entry: what it is on now and what it changed.
-function detailLine(task: string, info: BoardInfo, project: string): string {
-  const now = task && task !== info.purpose ? `şimdi: ${task}` : ''
-  const purpose = info.name && info.purpose ? `amaç: ${info.purpose}` : ''
-  const files = filesLine(info.files, project, 4)
-
-  return [purpose, now, files ? `dosyalar: ${files}` : ''].filter(Boolean).join(' · ')
 }
 
 // What the model reads after it changes a file: the board, only when it changed since
@@ -657,37 +599,11 @@ async function compactNow($: EngineInterface): Promise<void> {
     }
     forgetNotes()
     compactHinted = false
-    await note($, 'Pano', 'sohbet pano özetiyle sıkıştırıldı')
     void $.ui.toast('Sohbet pano özetiyle sıkıştırıldı.')
   } catch (error) {
     const busy = (await read($, workers)).find(worker => worker.id === 'main')?.status === 'working'
-    void $.ui.toast(
-      busy
-        ? 'Şef çalışırken sıkıştırılamaz; iş bitince yeniden dene.'
-        : `Sıkıştırılamadı: ${error instanceof Error ? error.message : String(error)}`,
-    )
+    void $.ui.toast(busy ? 'Şef çalışırken sıkıştırılamaz; iş bitince yeniden dene.' : `Sıkıştırılamadı: ${errorText(error)}`)
   }
-}
-
-async function saveDeferred($: EngineInterface, value: string): Promise<void> {
-  const names = [...new Set(value.split(/[\s,;]+/).map(name => name.trim()).filter(Boolean))]
-  const refused = names.filter(name => NEVER_DEFERRED.has(name))
-  const list = names.filter(name => !NEVER_DEFERRED.has(name))
-  await update($, rounds, r => ({ ...r, defer: r.defer + 1 }))
-  await $.store.set(STORE_DEFERRED, list)
-  await update($, deferred, () => list)
-  const not = refused.length > 0 ? ` (${refused.join(', ')} ertelenemez)` : ''
-  void $.ui.toast(
-    list.length > 0
-      ? `Yeni sohbetlerde ertelenecek: ${list.join(', ')}${not}. Bu sohbet önbelleği bozulmasın diye değişmez.`
-      : `Erteleme listesi boşaltıldı${not}; yeni sohbetlerde bütün araçlar önde.`,
-  )
-}
-
-async function storedList($: EngineInterface): Promise<string[]> {
-  const value = await $.store.get(STORE_DEFERRED).catch(() => undefined)
-
-  return Array.isArray(value) ? value.filter((name): name is string => typeof name === 'string' && !NEVER_DEFERRED.has(name)) : []
 }
 
 function cacheGauge(stats: { lastResponseAt: number | null; last: Parameters<typeof hitPercent>[0] }, ttl: number | null, now: number): CacheGauge {
@@ -705,8 +621,7 @@ const editedPath = (input: unknown): string | null => {
 
 type TurnUsageLike = Parameters<typeof fromUsage>[0]
 
-// A main-loop turn's tokens: the counters, the cache lifetime a long pause reveals,
-// and the fixed load every request carries, estimated locally (no request is sent).
+// A main-loop turn's tokens: the cache's clock, and the lifetime a long pause reveals.
 async function countTurn($: EngineInterface, agentId: string | undefined, used: TurnUsageLike | undefined): Promise<void> {
   if (agentId !== undefined || !used) return
   const turn = fromUsage(used)
@@ -720,10 +635,7 @@ async function countTurn($: EngineInterface, agentId: string | undefined, used: 
     }
   }
   await update($, tokens, stats => withTurn(stats, turn, now))
-  const measured = await $.session.usage({ breakdown: 'summary' })
-  const breakdown = measured.context.breakdown
-  if (breakdown) await update($, load, () => fixedLoad(breakdown, now))
-  const percent = measured.context.percent ?? 0
+  const percent = (await $.session.usage()).context.percent ?? 0
   if (percent >= COMPACT_HINT_PERCENT && !compactHinted) {
     compactHinted = true
     void $.ui.toast(`Bağlam %${percent}: Piksel Ofis panelinden pano özetiyle sıkıştırabilirsin.`)
@@ -744,7 +656,6 @@ async function agentHeld($: EngineInterface, input: unknown): Promise<string | n
   const key = `${found.id}|${description}`
   if (heldAgents.has(key)) return null
   heldAgents.add(key)
-  await note($, 'Pano', `alt ajan yerine ${found.label || 'başka sohbet'} raporu önerildi: ${clip(found.description, 30)}`)
 
   return findingText(found, now)
 }
@@ -761,7 +672,6 @@ async function sendToChat($: EngineInterface, to: string, text: string): Promise
   }
   const sent = await $.session.send({ to: { sessionId: peer.sessionId }, text })
   if (!sent.isDelivered) return `#${peer.slot + 1} sohbetine iletilemedi: ${sent.reason}`
-  await note($, 'Sen', `#${peer.slot + 1} sohbetine mesaj: ${clip(text, 40)}`)
 
   return `#${peer.slot + 1} "${titleOf(peer)}" sohbetine iletildi.`
 }
@@ -771,8 +681,8 @@ export const register: Register = on => {
     await $.command.register({ name: 'ofis', description: 'Piksel Ofis panelini aç' })
     const now = await $.session.usage()
     await update($, usage, () => toUsage(now.context, now.rateLimits, now.cost))
-    const storedDefer = await storedList($)
-    await update($, deferred, () => storedDefer)
+    loadedVersion = await manifestVersion($)
+    await update($, newer, () => null)
     const storedTtl = await $.store.get(STORE_TTL).catch(() => undefined)
     if (typeof storedTtl === 'number') await update($, cacheTtl, () => storedTtl)
     void $.ui.open({ id: PANE, title: TITLE })
@@ -791,15 +701,32 @@ export const register: Register = on => {
         },
         isDeferred: true,
       })
-      .catch((error: unknown) => $.ui.log(`ofis_mesaj aracı kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`))
+      .catch((error: unknown) => $.ui.log(`ofis_mesaj aracı kaydedilemedi: ${errorText(error)}`))
     try {
       const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
       if (home) {
         const cwd = await $.session.cwd()
         const sessionId = await $.session.id()
         const dir = `${home}/.claude/pixel-ofis-live`
+        const configDir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`
         const at = await $.clock.now()
-        link = { dir, sessionId, project: baseName(cwd), startedAt: at, lastText: '', lastAt: 0, lastJournal: '', ticks: 0, failed: false }
+        // A reload keeps the time this chat was last active; a new chat starts waiting now.
+        if ((await read($, activeAt)) === 0) await update($, activeAt, () => at)
+        link = {
+          dir,
+          configDir,
+          cwd,
+          sessionId,
+          project: baseName(cwd),
+          startedAt: at,
+          lastText: '',
+          lastAt: 0,
+          lastJournal: '',
+          ticks: 0,
+          failed: false,
+          transcript: null,
+          searched: false,
+        }
         // A resumed chat finds its own entry again: its name and purpose stay.
         const before = await $.fs.read(journalPath(dir, sessionId)).catch(() => '')
         const past = typeof before === 'string' ? parseChronicle(before) : null
@@ -809,9 +736,10 @@ export const register: Register = on => {
           await update($, board, info => (info.purpose ? info : { name, purpose, tasks, files }))
         }
         startLive($)
+        await refreshTitle($).catch((error: unknown) => $.ui.log(`Sohbet başlığı okunamadı: ${errorText(error)}`))
       }
     } catch (error) {
-      $.ui.log(`Diğer sohbetler izlenemiyor: ${error instanceof Error ? error.message : String(error)}`)
+      $.ui.log(`Diğer sohbetler izlenemiyor: ${errorText(error)}`)
     }
 
     return next(e)
@@ -827,16 +755,17 @@ export const register: Register = on => {
     }
     if (e.reason === 'clear') {
       // The next conversation of this process is another chat: a board of its own.
+      const at = await $.clock.now()
       await update($, board, () => EMPTY_BOARD)
       await update($, live, held => ({ ...held, slot: null }))
       await update($, tokens, () => EMPTY_TOKENS)
-      await update($, load, () => null)
+      await update($, activeAt, () => at)
       forgetNotes()
       heldWrites.clear()
       heldAgents.clear()
       briefs.clear()
       compactHinted = false
-      if (link) link.startedAt = await $.clock.now()
+      if (link) link.startedAt = at
     } else {
       timer?.cancel()
       timer = null
@@ -864,6 +793,7 @@ export const register: Register = on => {
       const task = clip(headline(e.text), 60)
       turnStartedAt = at
       contextAtStart = (await read($, usage))?.contextTokens ?? null
+      await update($, activeAt, () => at)
       await update($, workers, list =>
         list
           .filter(worker => worker.id === 'main' || worker.status === 'working')
@@ -872,7 +802,6 @@ export const register: Register = on => {
               worker.id === 'main' ? { ...worker, status: 'working', station: 'board', tool: null, task, tools: 0, startedAt: at } : worker,
           ),
       )
-      await note($, 'Şef', `yeni iş: ${clip(task, 50)}`)
       await changeBoard($, info => withTask(info, task))
     } else {
       const hire: Worker = { ...MAIN, id: e.agentId, name: 'Yardımcı', role: 'yardımcı', startedAt: at }
@@ -886,9 +815,11 @@ export const register: Register = on => {
     const started = await next(e)
     // A fork carries this chat's own context: its answer is no research for the others.
     if (started.agentId && !e.fork) briefs.set(started.agentId, { type: e.subagentType, description: e.description, prompt: e.prompt })
-    if (started.agentId) await hireHelper($, e.subagentType, e.description, started.agentId).catch(
-      (error: unknown) => $.ui.log(`Ofis güncellenemedi: ${error instanceof Error ? error.message : String(error)}`),
-    )
+    if (started.agentId) {
+      await hireHelper($, e.subagentType, e.description, started.agentId).catch((error: unknown) =>
+        $.ui.log(`Ofis güncellenemedi: ${errorText(error)}`),
+      )
+    }
 
     return started
   })
@@ -900,7 +831,7 @@ export const register: Register = on => {
     const hire: Worker = { ...MAIN, id, name: 'Yardımcı', role: 'yardımcı', startedAt: at }
     // The drawing's bookkeeping must never hold up the tool itself.
     await touch($, id, worker => ({ ...worker, status: 'working', station: stationOf(tool), tool, tools: worker.tools + 1 }), hire).catch(
-      (error: unknown) => $.ui.log(`Ofis güncellenemedi: ${error instanceof Error ? error.message : String(error)}`),
+      (error: unknown) => $.ui.log(`Ofis güncellenemedi: ${errorText(error)}`),
     )
 
     // Research another chat already had done: offered once before a subagent starts.
@@ -919,27 +850,20 @@ export const register: Register = on => {
     // Held back once per file: the model is shown what changed and asked to Edit.
     if (path && tool === 'Write' && conflicts.length > 0 && !heldWrites.has(key)) {
       heldWrites.add(key)
-      await note($, 'Pano', `üzerine yazma durduruldu: ${conflicts.map(one => one.label).join(', ')} bu dosyayı değiştirdi`)
 
       return { deny: heldWriteText(conflicts, await fileDiff($, path), now) }
     }
     const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError) return ran
-    // How much of the context the result takes: the main loop's alone fills this chat's.
-    if (e.agentId === undefined && typeof ran.text === 'string') {
-      const output = { tool, label: callLabel(tool, e), chars: ran.text.length, at: now }
-      await update($, tokens, stats => withOutput(stats, output)).catch(() => undefined)
-    }
-    if (!path) return ran
+    if (ran.deny !== undefined || ran.isError || !path) return ran
     await changeBoard($, info => ({ ...info, files: withFile(info.files, { path, at: now, tool }) })).catch((error: unknown) =>
-      $.ui.log(`Pano güncellenemedi: ${error instanceof Error ? error.message : String(error)}`),
+      $.ui.log(`Pano güncellenemedi: ${errorText(error)}`),
     )
     const extra: string[] = []
     // The board, when the model first changes a file after it changed: not with
     // every prompt, so a turn that only reads or talks is not charged for it.
     if (e.agentId === undefined) {
-      const board = await freshNote($).catch(() => null)
-      if (board) extra.push(board)
+      const note = await freshNote($).catch(() => null)
+      if (note) extra.push(note)
     }
     if (conflicts.length > 0 && now - (notedAt.get(key) ?? -Infinity) >= CONFLICT_NOTE_MS) {
       notedAt.set(key, now)
@@ -947,18 +871,6 @@ export const register: Register = on => {
     }
 
     return extra.length > 0 ? { ...ran, context: [...(ran.context ?? []), ...extra] } : ran
-  })
-
-  // A changed placement goes out in new threads only: the store is read for each, and
-  // nothing invalidates a description a thread has already sent.
-  on('tool.describe', async ($, e, next) => {
-    const told = await next(e)
-    const wanted = !NEVER_DEFERRED.has(e.tool) && (await storedList($)).includes(e.tool)
-    const isDeferred = wanted || told.isDeferred === true || (told.isDeferred === undefined && e.isDeferred === true)
-    const size: ToolSize = { tool: e.tool, tokens: approxTokens(told.description.length), isDeferred }
-    await update($, toolSizes, list => [size, ...list.filter(one => one.tool !== e.tool)]).catch(() => undefined)
-
-    return wanted ? { ...told, isDeferred: true } : told
   })
 
   // Every compaction of the main conversation, the engine's own included, is told
@@ -988,26 +900,16 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId ?? 'main'
     const failed = e.reason === 'error' || e.reason === 'refusal'
-    await countTurn($, e.agentId, e.usage).catch((error: unknown) =>
-      $.ui.log(`Token sayacı güncellenemedi: ${error instanceof Error ? error.message : String(error)}`),
-    )
+    await countTurn($, e.agentId, e.usage).catch((error: unknown) => $.ui.log(`Token sayacı güncellenemedi: ${errorText(error)}`))
     if (e.agentId !== undefined && !failed && !e.isAborted && e.answer.trim().length >= MIN_FINDING_CHARS) {
-      await saveFinding($, e.agentId, e.answer).catch((error: unknown) =>
-        $.ui.log(`Keşif kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`),
-      )
+      await saveFinding($, e.agentId, e.answer).catch((error: unknown) => $.ui.log(`Keşif kaydedilemedi: ${errorText(error)}`))
     }
-    let who = ''
-    let tools = 0
-    await touch($, id, worker => {
-      who = worker.name
-      tools = worker.tools
-      const status = failed ? 'error' : id === 'main' ? 'idle' : 'done'
-
-      return { ...worker, status, station: 'coffee', tool: null }
-    })
-    if (who) {
-      const how = failed ? 'takıldı' : e.isAborted ? 'durduruldu' : 'bitirdi'
-      await note($, who, `${how} (${tools} araç, ${Math.round(e.durationMs / 1000)} sn)`)
+    await touch($, id, worker => ({ ...worker, status: failed ? 'error' : id === 'main' ? 'idle' : 'done', station: 'coffee', tool: null }))
+    if (e.agentId === undefined) {
+      // The chat starts waiting for its next task; by now the session has its title.
+      const at = await $.clock.now()
+      await update($, activeAt, () => at)
+      await refreshTitle($).catch((error: unknown) => $.ui.log(`Sohbet başlığı okunamadı: ${errorText(error)}`))
     }
 
     return next(e)
@@ -1016,61 +918,15 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
-    // The terminal has no Svg and the mobile app no Input: each falls back.
+    // The terminal has no Svg: it gets the office as text.
     // The surface decides, not `in`: a table answers for names it lacks too.
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
-    const Input = e.surface !== 'mobile' && 'Input' in table ? table.Input : undefined
-    const team = await read($, workers)
-    const meters = await read($, usage)
-    const recent = await read($, log)
-    const held = await read($, live)
-    const files = await read($, attachments)
-    const round = await read($, rounds)
-    const fillable = await read($, canFill)
-    const info = await read($, board)
-    const past = await read($, history)
-    const spent = await read($, tokens)
-    const fixed = await read($, load)
-    const reports = await read($, findings)
-    const later = await read($, deferred)
-    const sizes = await read($, toolSizes)
-    const ttl = await read($, cacheTtl)
     const now = await $.clock.now()
-    const teams = teamsOf(team, info, held)
-    const gauge = cacheGauge(spent, ttl, now)
-    const last = spent.last
-    const heavy = spent.heavy.map(one => `${one.tool}${one.label ? ` ${one.label}` : ''} ≈${kilo(approxTokens(one.chars))}`)
-    const byTool = Object.entries(spent.byTool)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 4)
-      .map(([tool, chars]) => `${tool} ≈${kilo(approxTokens(chars))}`)
-    const front = sizes
-      .filter(one => !one.isDeferred)
-      .sort((a, b) => b.tokens - a.tokens)
-      .slice(0, 6)
-      .map(one => `${one.tool} ≈${kilo(one.tokens)}`)
+    const meters = await read($, usage)
+    const teams = teamsOf(await read($, workers), await read($, board), await read($, live), await read($, activeAt), now)
+    const gauge = cacheGauge(await read($, tokens), await read($, cacheTtl), now)
     const percent = meters?.contextPercent ?? 0
-
-    const rename = (value: string): void => {
-      const name = value.trim().slice(0, 60)
-      void update($, rounds, r => ({ ...r, name: r.name + 1 }))
-      void changeBoard($, held => ({ ...held, name })).then(() =>
-        $.ui.toast(name ? `Bu sohbetin adı: ${name}` : 'Ad kaldırıldı; panoda amacı görünür.'),
-      )
-    }
-    const removeFile = (path: string): void => {
-      void update($, attachments, list => list.filter(file => file.path !== path))
-    }
-    const addScreenshot = (): void => {
-      void latestScreenshot($).then(path =>
-        path ? addFiles($, [path]) : $.ui.toast('Ekran görüntüleri klasöründe görüntü bulunamadı.'),
-      )
-    }
-    const addPaths = (value: string): void => {
-      const paths = parsePaths(value)
-      void update($, rounds, r => ({ ...r, attach: r.attach + 1 }))
-      if (paths.length > 0) void addFiles($, paths)
-    }
+    const fresh = await read($, newer)
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -1079,164 +935,19 @@ export const register: Register = on => {
         ) : (
           <Text dimColor>{officeAlt(teams, meters, gauge)}</Text>
         )}
-        <Box flexDirection="column">
-          <Text weight="semibold">
-            Pano · {teams.length === 1 ? 'yalnız bu sohbet çalışıyor' : `${teams.length} sohbet çalışıyor`}
+        {fresh && (
+          <Text dimColor wrap="wrap">
+            Piksel Ofis {fresh.disk} hazır, bu sohbet hâlâ {fresh.loaded} sürümünde. Almak için sohbet sekmesini kapatıp geçmişten
+            yeniden aç: yeniden açmak kendi başına istek göndermez, sohbet kaldığı yerden sürer.
           </Text>
-          {teams.map((one, i) => {
-            const peer = one.isSelf ? null : held.peers[i - 1]
-            const detail = peer ? detailLine(peer.task, peer, peer.project) : detailLine(one.task, info, link?.project ?? '')
-
-            return (
-              <Box flexDirection="column">
-                <Text color={one.isSelf ? undefined : one.color} wrap="truncate-end">
-                  {teamLine(one)}
-                </Text>
-                {detail && (
-                  <Text dimColor wrap="truncate-end">
-                    {'   '}
-                    {detail}
-                  </Text>
-                )}
-              </Box>
-            )
-          })}
-          {past.length > 0 && <Text dimColor>Kapanan / sessiz sohbetler (son 24 saat):</Text>}
-          {past.map(one => (
-            <Text dimColor wrap="truncate-end">
-              {one.label || '—'} · {ago(one.updatedAt, now)} · {titleOf(one)}
-              {one.files.length > 0 ? ` · dosyalar: ${filesLine(one.files, one.project, 4)}` : ''}
-            </Text>
-          ))}
-          {Input && (
-            <Input
-              key={`ad-${round.name}`}
-              placeholder={`Bu sohbete ad ver (şimdi: ${titleOf(info)})`}
-              submitLabel="Kaydet"
-              onSubmit={rename}
-            />
-          )}
-          {reports.length > 0 && <Text dimColor>Diğer sohbetlerin keşifleri (alt ajan yeniden başlatılmadan önce önerilir):</Text>}
-          {reports.slice(0, 4).map(one => (
-            <Text dimColor wrap="truncate-end">
-              {one.label || '—'} · {one.type} · {ago(one.at, now)} · {one.description}
-            </Text>
-          ))}
-        </Box>
-        <Box flexDirection="column">
-          <Text weight="semibold">Token</Text>
-          <Text dimColor wrap="truncate-end">
-            {last
-              ? `Son tur: girdi ${kilo(last.input)} · önbellekten ${kilo(last.cacheRead)} · önbelleğe yazılan ${kilo(last.cacheWrite)} · çıktı ${kilo(last.output)}`
-              : 'Son tur: ilk yanıttan sonra görünür'}
-          </Text>
-          <Text dimColor wrap="truncate-end">
-            Önbellek: {gauge.text}
-            {gauge.hit === null ? '' : ` · isabet %${gauge.hit}`}
-            {spent.turns > 0 ? ` · oturum: ${spent.turns} tur, çıktı ${kilo(spent.total.output)}` : ''}
-          </Text>
-          {heavy.length > 0 && (
-            <Text dimColor wrap="truncate-end">
-              En ağır araç çıktıları: {heavy.join(' · ')}
-            </Text>
-          )}
-          {byTool.length > 0 && (
-            <Text dimColor wrap="truncate-end">
-              Araca göre çıktı: {byTool.join(' · ')}
-            </Text>
-          )}
-          {fixed && fixed.rows.length > 0 && (
-            <Text dimColor wrap="truncate-end">
-              Sabit yük (her istekte): {fixed.rows.slice(0, 5).map(row => `${row.name} ${kilo(row.tokens)}`).join(' · ')}
-            </Text>
-          )}
-          {fixed && fixed.memory.length > 0 && (
-            <Text dimColor wrap="truncate-end">
-              En büyük bellek dosyaları: {fixed.memory.map(row => `${row.name} ${kilo(row.tokens)}`).join(' · ')}
-            </Text>
-          )}
-          {percent >= COMPACT_OFFER_PERCENT && (
-            <Box flexDirection="row" flexWrap="wrap" gap={1}>
-              <Button key="sikistir" onPress={() => void compactNow($)}>
-                Pano özetiyle sıkıştır (bağlam %{percent})
-              </Button>
-            </Box>
-          )}
-          {front.length > 0 && (
-            <Text dimColor wrap="truncate-end">
-              Öndeki en büyük araç açıklamaları: {front.join(' · ')}
-            </Text>
-          )}
-          <Text dimColor wrap="truncate-end">
-            Ertelenen araçlar (yeni sohbetlerde ToolSearch arkasında): {later.length > 0 ? later.join(', ') : 'yok'}
-          </Text>
-          {Input && (
-            <Input
-              key={`ertele-${round.defer}`}
-              placeholder="Ertelenecek araç adları, virgülle (boş Enter: listeyi boşalt)"
-              submitLabel="Kaydet"
-              onSubmit={value => {
-                void saveDeferred($, value)
-              }}
-            />
-          )}
-        </Box>
-        {Input && (
-          <Box flexDirection="column" gap={1}>
-            <Input
-              key={`gorev-${round.task}`}
-              placeholder="Ekibe görev ver… (Enter: gönder)"
-              submitLabel="Gönder"
-              rows={2}
-              onInput={value => {
-                draft = value
-              }}
-              onSubmit={value => {
-                void sendTask($, value)
-              }}
-            />
-            {files.length > 0 && (
-              <Box flexDirection="row" flexWrap="wrap" gap={1}>
-                <Text dimColor>Ekler:</Text>
-                {files.map(file => (
-                  <Button key={`ek-${file.path}`} dimColor onPress={() => removeFile(file.path)}>
-                    {file.name} ✕
-                  </Button>
-                ))}
-              </Box>
-            )}
-            <Box flexDirection="row" flexWrap="wrap" gap={1}>
-              <Button key="ek-ekran" onPress={addScreenshot}>
-                + Son ekran görüntüsü
-              </Button>
-              {fillable && (
-                <Button key="kutuya-aktar" onPress={() => void toComposer($)}>
-                  Sohbet kutusuna aktar
-                </Button>
-              )}
-            </Box>
-            <Input
-              key={`ek-yolu-${round.attach}`}
-              placeholder="Ek dosya: yolu yapıştır, Enter (birden çok: tırnaklı ya da satır satır)"
-              submitLabel="Ekle"
-              onSubmit={addPaths}
-            />
-            <Text dimColor wrap="wrap">
-              Panelden verilen görev sohbet akışında mesaj balonu olarak görünmeyebilir; yanıt sohbete gelir, durumu burada izle.
-            </Text>
+        )}
+        {percent >= COMPACT_OFFER_PERCENT && (
+          <Box flexDirection="row" flexWrap="wrap" gap={1}>
+            <Button key="sikistir" onPress={() => void compactNow($)}>
+              Pano özetiyle sıkıştır (bağlam %{percent})
+            </Button>
           </Box>
         )}
-        <Box flexDirection="column">
-          {recent.length === 0 && <Text dimColor>Henüz hareket yok.</Text>}
-          {recent
-            .slice()
-            .reverse()
-            .map(entry => (
-              <Text dimColor wrap="truncate-end">
-                {entry.who}: {entry.text}
-              </Text>
-            ))}
-        </Box>
       </Box>
     )
   })

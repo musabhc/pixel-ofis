@@ -3,9 +3,18 @@ import type { Station, Team, Usage, Worker } from '../types'
 // The prompt cache as the HUD shows it: how warm, in words, and the last turn's hit.
 export type CacheGauge = { state: 'unknown' | 'warm' | 'cooling' | 'cold'; text: string; hit: number | null }
 
-// The office is drawn on a 320x254 grid: the room on 0..180, the meters below.
+// The office is drawn on a 320x322 grid: the room on 0..180, the waiting room on
+// 180..248, the meters below.
 const W = 320
-const H = 254
+const ROOM_H = 180
+const WAIT_TOP = 180
+const HUD_TOP = 248
+const H = 322
+
+// A chat that waits this long for its next task leaves through the door; from the
+// second value on it stands at the door, on its way out.
+export const LEAVE_AFTER_MS = 30 * 60 * 1000
+export const LEAVING_FROM_MS = 27 * 60 * 1000
 
 type Point = { x: number; y: number }
 
@@ -127,7 +136,7 @@ function shortTool(tool: string): string {
 }
 
 function bubbleText(worker: Worker): string {
-  if (worker.status === 'error') return 'hata!'
+  if (worker.status === 'error') return 'takıldı'
   if (worker.status === 'done') return 'bitti'
   if (worker.status === 'idle') return 'boşta'
 
@@ -147,13 +156,17 @@ function bubble(cx: number, top: number, text: string, isError: boolean): string
   )
 }
 
+// A name kept inside the drawing: one near an edge moves in rather than being cut.
 function nameTag(cx: number, y: number, text: string): string {
-  return `<text x="${cx}" y="${y}" font-size="5.5" fill="#ffffff" stroke="#1d1a26" stroke-width="1.6" paint-order="stroke" text-anchor="middle">${esc(text)}</text>`
+  const half = (text.length * 3.4) / 2 + 1
+  const x = Math.min(Math.max(cx, half), W - half)
+
+  return `<text x="${x}" y="${y}" font-size="5.5" fill="#ffffff" stroke="#1d1a26" stroke-width="1.6" paint-order="stroke" text-anchor="middle">${esc(text)}</text>`
 }
 
 function whiteboard(teams: Team[]): string {
   let out = r(140, 8, 76, 38, '#9aa3ad') + r(142, 10, 72, 34, '#eef1f4')
-  const tasks = teams.filter(team => team.task).slice(0, 3)
+  const tasks = teams.filter(team => team.task && team.waitingMs === null).slice(0, 3)
   if (tasks.length === 0) {
     out += r(146, 15, 30, 2, '#4a90d9') + r(146, 21, 44, 2, '#5bb56a') + r(146, 27, 22, 2, '#e05a7a')
     out += r(180, 30, 26, 10, '#ffe08a') + r(184, 33, 18, 2, '#c9a23a')
@@ -194,9 +207,9 @@ function room(teams: Team[], cache: CacheGauge | null): string {
   out += r(0, 0, W, 56, '#3b2f4a')
   for (let x = 8; x < W; x += 16) out += r(x, 0, 1, 50, '#433654')
   out += r(0, 50, W, 6, '#2a2135')
-  out += r(0, 56, W, 124, '#6b4f3a')
-  for (let y = 64; y < 180; y += 8) out += r(0, y, W, 1, '#5e4533')
-  for (let y = 56, row = 0; y < 180; y += 8, row += 1) {
+  out += r(0, 56, W, ROOM_H - 56, '#6b4f3a')
+  for (let y = 64; y < ROOM_H; y += 8) out += r(0, y, W, 1, '#5e4533')
+  for (let y = 56, row = 0; y < ROOM_H; y += 8, row += 1) {
     for (let x = row % 2 ? 20 : 0; x < W; x += 40) out += r(x, y, 1, 8, '#5e4533')
   }
   // Rug.
@@ -314,9 +327,9 @@ function meter(y: number, name: string, percent: number | null, note: string): s
 
 const HEAT_COLORS: Record<CacheGauge['state'], string> = { unknown: '#9a8fb0', warm: '#58f087', cooling: '#f0c419', cold: '#6bb8ff' }
 
-function hud(usage: Usage | null, now: number, active: number, chats: number, cache: CacheGauge | null): string {
-  let out = r(0, 180, W, H - 180, '#1d1a26') + r(0, 180, W, 2, '#5c4b7a')
-  let y = 186
+function hud(usage: Usage | null, now: number, active: number, waiting: number, cache: CacheGauge | null): string {
+  let out = r(0, HUD_TOP, W, H - HUD_TOP, '#1d1a26') + r(0, HUD_TOP, W, 2, '#5c4b7a')
+  let y = HUD_TOP + 6
   const limits = usage?.limits ?? []
   if (limits.length === 0) {
     out += label(6, y + 5.5, 'LİMİT: ilk yanıttan sonra görünür', 6, '#9a8fb0', 'start')
@@ -338,25 +351,119 @@ function hud(usage: Usage | null, now: number, active: number, chats: number, ca
     y += 11
   }
   const cost = usage?.usd !== null && usage?.usd !== undefined ? `MALİYET $${usage.usd.toFixed(2)}` : 'MALİYET --'
-  const chatNote = chats > 1 ? `   ·   SOHBET: ${chats}` : ''
-  out += label(6, Math.min(y + 5.5, H - 3), `${cost}   ·   EKİP: ${active} çalışıyor${chatNote}`, 6, '#e8dcc0', 'start')
+  const waitNote = waiting > 0 ? `   ·   BEKLEYEN: ${waiting}` : ''
+  out += label(6, Math.min(y + 5.5, H - 3), `${cost}   ·   ÇALIŞAN: ${active}${waitNote}`, 6, '#e8dcc0', 'start')
 
   return out
 }
 
-// A peer's people carry their chat's label, so two chats' chiefs are told apart.
-const shownName = (team: Team, worker: Worker): string => (team.isSelf ? worker.name : `${worker.name}${team.label}`)
+const NAME_CHARS = 14
+
+// A chat's chief carries the chat's title, shortened; a helper its role's name.
+function shownName(team: Team, worker: Worker): string {
+  if (worker.id !== 'main') return worker.name
+  const title = team.title.replace(/\s+/g, ' ').trim()
+  if (!title) return worker.name
+
+  return title.length > NAME_CHARS ? `${title.slice(0, NAME_CHARS - 1).trimEnd()}…` : title
+}
+
+function waitText(ms: number): string {
+  if (ms >= LEAVING_FROM_MS) return 'çıkıyor'
+  const minutes = Math.floor(ms / 60000)
+
+  return minutes < 1 ? 'az önce' : `${minutes} dk`
+}
+
+// ---- The waiting room: chats that finished and wait for their next task ------------
+
+const SEATS_X = [8, 48, 88, 128, 168, 208]
+const DOOR_X = 284
+const SEAT_Y = 203
+const AT_DOOR = 2
+
+function waitingRoom(): string {
+  let out = r(0, WAIT_TOP, W, 2, '#5c4b7a')
+  // Wall, its stripes and the baseboard; the tiled floor.
+  out += r(0, WAIT_TOP + 2, W, 22, '#2f3d4f')
+  for (let x = 6; x < W; x += 12) out += r(x, WAIT_TOP + 2, 1, 22, '#36475b')
+  out += r(0, WAIT_TOP + 24, W, 3, '#24303d')
+  out += r(0, WAIT_TOP + 27, W, HUD_TOP - WAIT_TOP - 27, '#56606b')
+  for (let y = WAIT_TOP + 37; y < HUD_TOP; y += 10) out += r(0, y, W, 1, '#4b545e')
+  for (let y = WAIT_TOP + 27, row = 0; y < HUD_TOP; y += 10, row += 1) {
+    for (let x = row % 2 ? 12 : 0; x < W; x += 24) out += r(x, y, 1, 10, '#4b545e')
+  }
+  // The sign.
+  out += r(228, WAIT_TOP + 5, 52, 9, '#1d1a26') + r(229, WAIT_TOP + 6, 50, 7, '#3b2f4a')
+  out += label(254, WAIT_TOP + 11.4, 'BEKLEME ODASI', 4.5, '#e8dcc0')
+  // A table with magazines.
+  out += r(236, 224, 24, 3, '#8b5a2b') + r(238, 227, 2, 9, '#5a3418') + r(256, 227, 2, 9, '#5a3418')
+  out += r(239, 221, 9, 3, '#e05a7a') + r(249, 222, 8, 2, '#4a90d9')
+  // The door out, with its sign.
+  out += r(DOOR_X, WAIT_TOP + 4, 30, HUD_TOP - WAIT_TOP - 4, '#3a2414') + r(DOOR_X + 3, WAIT_TOP + 7, 24, HUD_TOP - WAIT_TOP - 7, '#8b5a2b')
+  out += r(DOOR_X + 6, WAIT_TOP + 17, 18, 20, '#7a4d24') + r(DOOR_X + 6, WAIT_TOP + 41, 18, 22, '#7a4d24')
+  out += r(DOOR_X + 22, WAIT_TOP + 38, 2, 2, '#f0c419')
+  out += r(DOOR_X + 5, WAIT_TOP + 8, 20, 7, '#1e7a3a') + label(DOOR_X + 15, WAIT_TOP + 13.2, 'ÇIKIŞ', 4.5, '#d8ffd8')
+
+  return out
+}
+
+const chairBack = (x: number): string => r(x - 1, 204, 18, 2, '#5a2b2b') + r(x - 1, 206, 18, 12, '#7a3b3b')
+
+const chairSeat = (x: number): string =>
+  r(x - 2, 219, 20, 4, '#8f4a4a') + r(x - 1, 223, 2, 9, '#3a2414') + r(x + 15, 223, 2, 9, '#3a2414')
+
+type Waiting = { worker: Worker; name: string; look: Look; badge: string; waitingMs: number }
+
+// The longest waiting nearest the door, those about to leave at it; the drawing and
+// its name tags and bubbles, which go over everything.
+function lounge(waiting: Waiting[]): { room: string; tags: string } {
+  let room = waitingRoom()
+  let tags = ''
+  const queue = [...waiting].sort((a, b) => a.waitingMs - b.waitingMs)
+  const leaving = queue.filter(one => one.waitingMs >= LEAVING_FROM_MS)
+  const sitting = queue.filter(one => one.waitingMs < LEAVING_FROM_MS)
+  const shown = sitting.slice(0, SEATS_X.length)
+  for (const x of SEATS_X) room += chairBack(x)
+  shown.forEach((one, i) => {
+    room += sprite(SEATS_X[i] ?? 0, SEAT_Y, one.look, 'idle', one.badge)
+  })
+  for (const x of SEATS_X) room += chairSeat(x)
+  shown.forEach((one, i) => {
+    const cx = (SEATS_X[i] ?? 0) + 8
+    const isError = one.worker.status === 'error'
+    tags += nameTag(cx, i % 2 ? 245 : 239, one.name)
+    tags += bubble(cx, SEAT_Y, isError ? 'takıldı' : waitText(one.waitingMs), isError)
+  })
+  leaving.slice(0, AT_DOOR).forEach((one, i) => {
+    const x = DOOR_X + 7 - i * 14
+    room += sprite(x, 208, one.look, 'idle', one.badge)
+    tags += nameTag(x + 8, 245, one.name)
+    tags += bubble(x + 8, 208, 'çıkıyor', false)
+  })
+  const hidden = sitting.length - shown.length + Math.max(0, leaving.length - AT_DOOR)
+  if (hidden > 0) tags += label(248, 245, `+${hidden} bekliyor`, 5, '#e8dcc0')
+  if (waiting.length === 0) room += label(112, 231, 'kimse beklemiyor', 5.5, '#9aa6b2')
+
+  return { room, tags }
+}
 
 export function officeSvg(teams: Team[], usage: Usage | null, now: number, cache: CacheGauge | null = null): string {
   type Placed = { worker: Worker; name: string; at: Point; look: Look; slot: number; badge: string | null }
   const placed: Placed[] = []
+  const waiting: Waiting[] = []
   const used: Record<Station, number> = { desk: 0, shelf: 0, terminal: 0, web: 0, board: 0, coffee: 0 }
   let lookIndex = 0
   for (const team of teams) {
     for (const worker of team.workers) {
       const isMain = worker.id === 'main'
       const look = isMain && team.isSelf ? MAIN_LOOK : (LOOKS[lookIndex++ % LOOKS.length] ?? MAIN_LOOK)
-      // A worker that finished waits at the coffee corner.
+      // A chat with nobody at work waits in the waiting room: its chief alone.
+      if (team.waitingMs !== null) {
+        if (isMain) waiting.push({ worker, name: shownName(team, worker), look, badge: team.color, waitingMs: team.waitingMs })
+        continue
+      }
+      // A helper that finished waits at the coffee corner.
       const station: Station = worker.status === 'working' ? worker.station : 'coffee'
       const slots = SLOTS[station]
       const n = used[station]++
@@ -366,7 +473,7 @@ export function officeSvg(teams: Team[], usage: Usage | null, now: number, cache
         worker,
         name: shownName(team, worker),
         look,
-        badge: isMain ? team.color : null,
+        badge: team.color,
         slot: station === 'desk' ? n % slots.length : -1,
         at: { x: base.x + shift, y: base.y + shift },
       })
@@ -392,6 +499,7 @@ export function officeSvg(teams: Team[], usage: Usage | null, now: number, cache
     tags += nameTag(cx, one.slot >= 0 ? 131 : one.at.y + 30, one.name)
     tags += bubble(cx, one.at.y, bubbleText(one.worker), one.worker.status === 'error')
   }
+  const lobby = lounge(waiting)
 
   const active = placed.filter(one => one.worker.status === 'working').length
 
@@ -402,18 +510,27 @@ export function officeSvg(teams: Team[], usage: Usage | null, now: number, cache
     seated.map(draw).join('') +
     desks(busyDesks) +
     standing.map(draw).join('') +
+    lobby.room +
     tags +
-    hud(usage, now, active, teams.length, cache) +
+    lobby.tags +
+    hud(usage, now, active, waiting.length, cache) +
     '</svg>'
   )
 }
 
 export function officeAlt(teams: Team[], usage: Usage | null, cache: CacheGauge | null = null): string {
-  const people = (team: Team): string => team.workers.map(worker => `${shownName(team, worker)}: ${bubbleText(worker)}`).join(', ')
-  const own = teams.filter(team => team.isSelf).map(people).join(', ')
-  const others = teams.filter(team => !team.isSelf).map(people).join(', ')
+  const working = teams
+    .filter(team => team.waitingMs === null)
+    .flatMap(team => team.workers.map(worker => `${shownName(team, worker)}: ${bubbleText(worker)}`))
+  const waiting = teams.flatMap(team =>
+    team.waitingMs === null
+      ? []
+      : team.workers.filter(worker => worker.id === 'main').map(worker => `${shownName(team, worker)} (${waitText(team.waitingMs ?? 0)})`),
+  )
   const limits = (usage?.limits ?? []).map(limit => `${LIMIT_NAMES[limit.kind] ?? limit.kind} %${limit.percentUsed}`).join(', ')
   const warm = cache ? ` Önbellek: ${cache.text}${cache.hit === null ? '' : `, isabet %${cache.hit}`}.` : ''
+  const work = working.length > 0 ? ` Çalışan: ${working.join(', ')}.` : ' Çalışan yok.'
+  const wait = waiting.length > 0 ? ` Bekleme odası: ${waiting.join(', ')}.` : ''
 
-  return `Piksel ofis. ${own}.${others ? ` Diğer sohbetler: ${others}.` : ''}${limits ? ` Limitler: ${limits}.` : ''}${warm}`
+  return `Piksel ofis.${work}${wait}${limits ? ` Limitler: ${limits}.` : ''}${warm}`
 }

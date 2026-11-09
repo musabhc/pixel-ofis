@@ -227,6 +227,47 @@ export function parseFindings(text: string): Finding[] {
   }
 }
 
+// ---- The session's title, as Claude Code keeps it in the transcript -------------------
+
+const TITLE_ROWS: readonly (readonly [type: string, field: string])[] = [
+  ['custom-title', 'customTitle'],
+  ['ai-title', 'aiTitle'],
+]
+
+// The newest row of `type` in a JSONL transcript, its `field`; '' when there is none.
+// A row is matched by its own `type`, so the same words inside a message do not count:
+// there they are escaped.
+function lastRow(text: string, type: string, field: string): string {
+  const needle = `"type":"${type}"`
+  let from = text.length
+  while (from > 0) {
+    const at = text.lastIndexOf(needle, from - 1)
+    if (at < 0) return ''
+    const start = text.lastIndexOf('\n', at) + 1
+    const end = text.indexOf('\n', at)
+    try {
+      const row = JSON.parse(text.slice(start, end < 0 ? undefined : end)) as Record<string, unknown>
+      const value = row[field]
+      if (row.type === type && typeof value === 'string' && value.trim()) return value.replace(/\s+/g, ' ').trim()
+    } catch {
+      // Not a whole row: look further back.
+    }
+    from = start
+  }
+
+  return ''
+}
+
+// The title the person gave the chat, else the one Claude Code generated for it.
+export function transcriptTitle(text: string): string {
+  for (const [type, field] of TITLE_ROWS) {
+    const title = lastRow(text, type, field)
+    if (title) return title
+  }
+
+  return ''
+}
+
 export function parseChronicle(text: string): Chronicle | null {
   try {
     const value = JSON.parse(text) as Partial<Chronicle>

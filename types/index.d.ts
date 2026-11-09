@@ -24,17 +24,17 @@ export type Usage = {
   usd: number | null
 }
 
-export type LogEntry = { at: number; who: string; text: string }
-
 // A file a chat changed through Edit, Write, MultiEdit or NotebookEdit.
 export type FileChange = { path: string; at: number; tool: string }
 
-// What a chat is for, kept on the board: the name the person gave it, its first
-// task, its latest tasks and the files it changed.
+// What a chat is for, kept on the board: its title (the one Claude Code shows for the
+// session), its first task, its latest tasks and the files it changed.
 export type BoardInfo = { name: string; purpose: string; tasks: string[]; files: FileChange[] }
 
 // Another chat's team, as its own session last wrote it to the shared live folder.
-export type Peer = BoardInfo & { sessionId: string; slot: number; project: string; task: string; workers: Worker[] }
+// `activeAt`: when its main loop last started or finished a turn (absent from chats
+// that run an older version of the mod).
+export type Peer = BoardInfo & { sessionId: string; slot: number; project: string; task: string; workers: Worker[]; activeAt?: number }
 
 // The live folder as this session sees it: the slot it writes, the chats it reads.
 export type Live = { slot: number | null; peers: Peer[] }
@@ -49,32 +49,15 @@ export type Chronicle = BoardInfo & {
   ended?: true
 }
 
-export type Attachment = { path: string; name: string }
-
-// Bumped to give a text field a new key, which draws it empty.
-export type Rounds = { task: number; attach: number; name: number; defer: number }
-
 // A turn's tokens as the API counted them.
 export type TurnTokens = { input: number; cacheRead: number; cacheWrite: number; output: number }
 
-// A tool result that took much of the context: what it was and its size in characters.
-export type HeavyOutput = { tool: string; label: string; chars: number; at: number }
-
-// What this chat spent: the last turn, the whole session, the heaviest tool results,
-// and when the main loop last heard from the model (the prompt cache's clock).
+// The last turn's tokens and when the main loop last heard from the model: the prompt
+// cache's clock the HUD shows.
 export type TokenStats = {
   last: TurnTokens | null
-  total: TurnTokens
-  turns: number
-  heavy: HeavyOutput[]
-  byTool: Record<string, number>
   lastResponseAt: number | null
 }
-
-// What every request carries before the conversation itself: the context breakdown's
-// rows and the largest memory files, as estimated tokens.
-export type LoadRow = { name: string; tokens: number }
-export type FixedLoad = { rows: LoadRow[]; memory: LoadRow[]; measuredAt: number }
 
 // A subagent's report kept for the other chats, so they need not research it again.
 export type Finding = {
@@ -89,10 +72,8 @@ export type Finding = {
   at: number
 }
 
-// A tool the model sees in the prompt's list, and the size of its description.
-export type ToolSize = { tool: string; tokens: number; isDeferred: boolean }
-
-// One team in the drawing: this chat's or a peer's.
+// One team in the drawing: this chat's or a peer's. `waitingMs` is how long the chat
+// has been waiting for its next task, null while anyone in it works.
 export type Team = {
   label: string
   color: string
@@ -101,26 +82,21 @@ export type Team = {
   task: string
   files: number
   workers: Worker[]
+  waitingMs: number | null
 }
 
 declare module 'claude-code' {
   interface PluginState {
     'pixel-ofis': {
       workers: Shaped<Worker[]>
-      log: Shaped<LogEntry[]>
       usage: Shaped<Usage | null>
       live: Shaped<Live>
       board: Shaped<BoardInfo>
       history: Shaped<Chronicle[]>
-      attachments: Shaped<Attachment[]>
-      rounds: Shaped<Rounds>
-      canFill: Shaped<boolean>
       tokens: Shaped<TokenStats>
-      load: Shaped<FixedLoad | null>
-      findings: Shaped<Finding[]>
-      deferred: Shaped<string[]>
-      toolSizes: Shaped<ToolSize[]>
       cacheTtl: Shaped<number | null>
+      activeAt: Shaped<number>
+      newer: Shaped<{ loaded: string; disk: string } | null>
     }
   }
 }
