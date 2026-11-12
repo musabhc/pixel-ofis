@@ -90,6 +90,7 @@ declare module 'claude-code' {
     'pixel-ofis': {
       workers: Shaped<Worker[]>
       usage: Shaped<Usage | null>
+      sharedLimits: Shaped<LimitReading[]>
       live: Shaped<Live>
       board: Shaped<BoardInfo>
       history: Shaped<Chronicle[]>

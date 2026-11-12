@@ -67,6 +67,8 @@ type World = {
   diff?: string
   // The mod's own manifest on disk: its version, which a test may change later.
   manifest?: { version: string }
+  // The rate-limit windows this chat's last response reported.
+  limits?: { kind: string; percentUsed: number; resetsAt?: string }[]
 }
 
 // The engine beneath the plugin: a session, a disk in memory and the person's actions.
@@ -90,12 +92,13 @@ function world(on: On, files: Map<string, string> = new Map(), more: World = {})
     return { value: undefined }
   })
   on('ui.log', () => ({ value: undefined }))
-  const usage = { ...USAGE, context: more.usage ?? USAGE.context }
+  const usage = { ...USAGE, context: more.usage ?? USAGE.context, rateLimits: more.limits ?? USAGE.rateLimits }
   on('session.usage', () => ({ value: usage as never }))
   on('session.id', () => ({ value: 'me' }))
   on('session.cwd', () => ({ value: 'C:\\work\\demo-app' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
   on('session.compact', (_, e) => {
     compacts.push(e.instructions ?? '')
 
@@ -440,6 +443,73 @@ test('a held Write shows the uncommitted changes and asks for an Edit instead', 
   expect(text).toContain('```diff\n@@ -1 +1 @@\n-eski\n+onların satırı')
   expect(text).not.toContain('index 1..2')
   expect(text).toContain('Edit ile yalnız kendi değiştireceğin yeri')
+})
+
+const LIMITS = `${LIVE}/limits.json`
+const FIVE_RESET = '2026-11-03T14:00:00Z'
+const readings = (files: Map<string, string>) =>
+  (JSON.parse(files.get(norm(LIMITS)) ?? '{"readings":[]}') as { readings: { kind: string; percentUsed: number }[] }).readings
+
+test("the limits are the account's: an idle chat shows what the other chats spent", async ($, on) => {
+  const files = new Map([[LIMITS, JSON.stringify({ readings: [{ kind: 'five_hour', percentUsed: 30, resetsAt: FIVE_RESET }] })]])
+  const { clock } = world(on, files)
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+
+  // This chat's own 42 is later than the file's 30 in the same window: it is written there.
+  const first = await office($)
+  expect(first.alt).toContain('5 SAAT %42')
+  await first.ui.unmount()
+  expect(readings(files).find(one => one.kind === 'five_hour')?.percentUsed).toBe(42)
+  expect(readings(files).find(one => one.kind === 'seven_day')?.percentUsed).toBe(88)
+
+  // Another chat spends on while this one idles: its response's reading reaches this pane.
+  files.set(
+    norm(LIMITS),
+    JSON.stringify({
+      readings: [
+        { kind: 'five_hour', percentUsed: 71, resetsAt: FIVE_RESET },
+        { kind: 'seven_day', percentUsed: 91, resetsAt: null },
+      ],
+    }),
+  )
+  await clock.advance(15000)
+  const idle = await office($)
+  expect(idle.alt).toContain('5 SAAT %71')
+  expect(idle.alt).toContain('7 GÜN %91')
+  await idle.ui.unmount()
+
+  // An older chat writes its stale reading over the file: this chat writes the later one back.
+  files.set(norm(LIMITS), JSON.stringify({ readings: [{ kind: 'five_hour', percentUsed: 50, resetsAt: FIVE_RESET }] }))
+  await clock.advance(15000)
+  expect(readings(files).find(one => one.kind === 'five_hour')?.percentUsed).toBe(71)
+})
+
+test('a new window wins over a fuller old one, and a window past its reset shows empty', async ($, on) => {
+  const old = { kind: 'five_hour', percentUsed: 97, resetsAt: '2026-11-03T09:00:00Z' }
+  const files = new Map([[LIMITS, JSON.stringify({ readings: [old] })]])
+  const soon = '2026-11-03T12:20:00Z'
+  const { clock } = world(on, files, { limits: [{ kind: 'five_hour', percentUsed: 42, resetsAt: soon }] })
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+
+  // The file's 97 belongs to a window that reset at nine: this chat's 42 is the live one.
+  const first = await office($)
+  expect(first.alt).toContain('5 SAAT %42')
+  await first.ui.unmount()
+
+  // A response reports a higher figure of the same window: the pane and the file follow it.
+  await $.session.measure({
+    context: USAGE.context,
+    rateLimits: [{ kind: 'five_hour', percentUsed: 64, resetsAt: soon }],
+    cost: USAGE.cost,
+    changed: ['rateLimits'],
+  })
+  expect(readings(files).find(one => one.kind === 'five_hour')?.percentUsed).toBe(64)
+
+  // Past its reset with no response since: the five-hour window has started over.
+  await clock.advance(21 * MINUTE)
+  const after = await office($)
+  expect(after.alt).toContain('5 SAAT %0')
+  await after.ui.unmount()
 })
 
 test('the HUD shows the cache hit, and how warm the cache is', async ($, on) => {

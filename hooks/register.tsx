@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionContextUsage, SessionCost, SessionRateLimit, Timer } from 'claude-code'
 
-import type { BoardInfo, Chronicle, Finding, Live, Peer, Station, Team, Usage, Worker } from '../types'
+import type { BoardInfo, Chronicle, Finding, LimitReading, Live, Peer, Station, Team, Usage, Worker } from '../types'
 import {
   boardNote,
   clipDiff,
@@ -23,6 +23,7 @@ import {
   withFile,
   withTask,
 } from './board'
+import { currentLimits, limitsText, mergeLimits, parseLimits } from './limits'
 import { LEAVE_AFTER_MS, officeAlt, officeSvg } from './scene'
 import type { CacheGauge } from './scene'
 import { EMPTY_TOKENS, fromUsage, hitPercent, learnTtl, warmth, warmthText, withTurn } from './tokens'
@@ -46,6 +47,8 @@ const MAIN: Worker = {
 // outlives a reload and is then read as the initial one.
 const workers = atom({ plugin: 'pixel-ofis', key: 'workers' } as const, [MAIN], { shape: 'workers-1' })
 const usage = atom({ plugin: 'pixel-ofis', key: 'usage' } as const, null, { shape: 'usage-1' })
+// The account's rate-limit windows at the latest reading any chat on this machine took.
+const sharedLimits = atom({ plugin: 'pixel-ofis', key: 'sharedLimits' } as const, [], { shape: 'shared-limits-1' })
 const live = atom({ plugin: 'pixel-ofis', key: 'live' } as const, { slot: null, peers: [] }, { shape: 'live-3' })
 const board = atom({ plugin: 'pixel-ofis', key: 'board' } as const, EMPTY_BOARD, { shape: 'board-1' })
 const history = atom({ plugin: 'pixel-ofis', key: 'history' } as const, [], { shape: 'history-1' })
@@ -75,6 +78,8 @@ const HEARTBEAT_MS = 10000
 const STALE_MS = 45000
 // The journal folder is read every tenth tick: ended chats change seldom.
 const HISTORY_EVERY = 10
+// The other chats' limit readings every fifth tick: a whole point takes minutes to spend.
+const LIMITS_EVERY = 5
 const REDRAW_EVERY = 20
 const HISTORY_SPAN_MS = 24 * 60 * 60 * 1000
 const HISTORY_SHOWN = 6
@@ -249,6 +254,24 @@ function parseSnapshot(text: string): Snapshot | null {
   }
 }
 
+const limitsPath = (dir: string): string => `${dir}/limits.json`
+
+// Joins the rate-limit readings this chat knows (its own and those it already took from
+// the other chats) with the shared file's, and shows the latest of all. Every write
+// merges, so a later reading a racing write lost is written back on the next tick.
+// `mine`: a reading this chat's response just reported.
+async function shareLimits($: EngineInterface, mine: LimitReading[] = []): Promise<void> {
+  let latest = mergeLimits(await read($, sharedLimits), mine)
+  if (link) {
+    const path = limitsPath(link.dir)
+    const text = await $.fs.read(path).catch(() => '')
+    const stored = typeof text === 'string' ? parseLimits(text) : []
+    latest = mergeLimits(stored, latest)
+    if (limitsText(latest) !== limitsText(stored)) await $.fs.write(path, limitsText(latest))
+  }
+  if (limitsText(latest) !== limitsText(await read($, sharedLimits))) await update($, sharedLimits, () => latest)
+}
+
 const journalDir = (dir: string): string => `${dir}/journal`
 const journalPath = (dir: string, sessionId: string): string => `${journalDir(dir)}/${sessionId}.json`
 
@@ -412,6 +435,8 @@ async function tick($: EngineInterface): Promise<void> {
     }
   }
   if (slot !== null) await writeSlot($, slot, now, false)
+  // What the other chats' responses said of the account's limits meanwhile.
+  if (link.ticks % LIMITS_EVERY === 0) await shareLimits($)
 
   const peers: Peer[] = []
   snaps.forEach((snap, index) => {
@@ -680,7 +705,10 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'ofis', description: 'Piksel Ofis panelini aç' })
     const now = await $.session.usage()
-    await update($, usage, () => toUsage(now.context, now.rateLimits, now.cost))
+    const started = toUsage(now.context, now.rateLimits, now.cost)
+    await update($, usage, () => started)
+    // Shared with the other chats on the first tick, once the live folder is known.
+    await update($, sharedLimits, known => mergeLimits(known, started.limits))
     loadedVersion = await manifestVersion($)
     await update($, newer, () => null)
     const storedTtl = await $.store.get(STORE_TTL).catch(() => undefined)
@@ -781,7 +809,9 @@ export const register: Register = on => {
   })
 
   on('session.measure', async ($, e, next) => {
-    await update($, usage, () => toUsage(e.context, e.rateLimits, e.cost))
+    const measured = toUsage(e.context, e.rateLimits, e.cost)
+    await update($, usage, () => measured)
+    await shareLimits($, measured.limits).catch((error: unknown) => $.ui.log(`Limitler paylaşılamadı: ${errorText(error)}`))
 
     return next(e)
   })
@@ -922,7 +952,10 @@ export const register: Register = on => {
     // The surface decides, not `in`: a table answers for names it lacks too.
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
     const now = await $.clock.now()
-    const meters = await read($, usage)
+    const own = await read($, usage)
+    // The limits are the account's: the latest any chat read, not only this one.
+    const limits = currentLimits(mergeLimits(own?.limits ?? [], await read($, sharedLimits)), now)
+    const meters = own ? { ...own, limits } : null
     const teams = teamsOf(await read($, workers), await read($, board), await read($, live), await read($, activeAt), now)
     const gauge = cacheGauge(await read($, tokens), await read($, cacheTtl), now)
     const percent = meters?.contextPercent ?? 0
