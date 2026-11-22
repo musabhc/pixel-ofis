@@ -34,7 +34,16 @@ export type BoardInfo = { name: string; purpose: string; tasks: string[]; files:
 // Another chat's team, as its own session last wrote it to the shared live folder.
 // `activeAt`: when its main loop last started or finished a turn (absent from chats
 // that run an older version of the mod).
-export type Peer = BoardInfo & { sessionId: string; slot: number; project: string; task: string; workers: Worker[]; activeAt?: number }
+// `jobs`: its background jobs (absent from chats that run an older version of the mod).
+export type Peer = BoardInfo & {
+  sessionId: string
+  slot: number
+  project: string
+  task: string
+  workers: Worker[]
+  activeAt?: number
+  jobs?: Job[]
+}
 
 // The live folder as this session sees it: the slot it writes, the chats it reads.
 export type Live = { slot: number | null; peers: Peer[] }
@@ -72,6 +81,43 @@ export type Finding = {
   at: number
 }
 
+// Work a chat left running in the background: a shell command or a monitor started with
+// `run_in_background`, or a subagent sent to the background. `output` is the file it
+// writes (a shell's or a monitor's `.output`, a subagent's transcript), readable by
+// every chat on the machine.
+export type JobKind = 'shell' | 'monitor' | 'agent'
+
+export type JobStatus = 'running' | 'stopping' | 'completed' | 'failed' | 'killed' | 'ended'
+
+export type Job = {
+  id: string
+  kind: JobKind
+  tool: string
+  title: string
+  command: string
+  output: string | null
+  by: string
+  startedAt: number
+  endedAt: number | null
+  status: JobStatus
+  // How it ended, as the task's notification summed it up.
+  summary: string
+}
+
+// A job as the list shows it: with the chat it belongs to.
+export type SharedJob = Job & {
+  sessionId: string
+  label: string
+  chat: string
+  isOwn: boolean
+  // Nobody in its chat works: a running job there may have been forgotten.
+  isChatIdle: boolean
+}
+
+// What the pane shows: the office (`key` null) or one job by `sessionId:id`; which
+// page of its output, the newest 0; how far a stop has been confirmed.
+export type JobView = { key: string | null; page: number; confirm: 0 | 1 | 2 }
+
 // One team in the drawing: this chat's or a peer's. `waitingMs` is how long the chat
 // has been waiting for its next task, null while anyone in it works.
 export type Team = {
@@ -98,6 +144,8 @@ declare module 'claude-code' {
       cacheTtl: Shaped<number | null>
       activeAt: Shaped<number>
       newer: Shaped<{ loaded: string; disk: string } | null>
+      jobs: Shaped<Job[]>
+      jobView: Shaped<JobView>
     }
   }
 }

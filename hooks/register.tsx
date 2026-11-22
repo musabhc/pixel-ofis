@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionContextUsage, SessionCost, SessionRateLimit, Timer } from 'claude-code'
 
-import type { BoardInfo, Chronicle, Finding, LimitReading, Live, Peer, Station, Team, Usage, Worker } from '../types'
+import type { BoardInfo, Chronicle, Finding, Job, JobKind, JobStatus, JobView, LimitReading, Live, Peer, SharedJob, Station, Team, Usage, Worker } from '../types'
 import {
   boardNote,
   clipDiff,
@@ -23,6 +23,26 @@ import {
   withFile,
   withTask,
 } from './board'
+import {
+  changeJob,
+  dirOf,
+  durationText,
+  ended,
+  isLive,
+  jobKey,
+  jobStatusWord,
+  KIND_WORDS,
+  outputPathFrom,
+  pageRange,
+  pageText,
+  parseJobs,
+  parseNotices,
+  parseStops,
+  prunedJobs,
+  sortedJobs,
+  STOP_REQUEST_MS,
+  withJob,
+} from './jobs'
 import { currentLimits, limitsText, mergeLimits, parseLimits } from './limits'
 import { LEAVE_AFTER_MS, officeAlt, officeSvg } from './scene'
 import type { CacheGauge } from './scene'
@@ -58,6 +78,11 @@ const cacheTtl = atom({ plugin: 'pixel-ofis', key: 'cacheTtl' } as const, null, 
 const activeAt = atom({ plugin: 'pixel-ofis', key: 'activeAt' } as const, 0, { shape: 'active-at-1' })
 // A newer version of the mod on disk than this chat runs: what the pane warns of.
 const newer = atom({ plugin: 'pixel-ofis', key: 'newer' } as const, null, { shape: 'newer-1' })
+// This chat's background jobs, running and lately finished.
+const jobs = atom({ plugin: 'pixel-ofis', key: 'jobs' } as const, [], { shape: 'jobs-1' })
+// The office, or one job's output in its place.
+const OFFICE_VIEW: JobView = { key: null, page: 0, confirm: 0 }
+const jobView = atom({ plugin: 'pixel-ofis', key: 'jobView' } as const, OFFICE_VIEW, { shape: 'job-view-1' })
 
 // Kept across sessions in the plugin's store.
 const STORE_TTL = 'cacheTtlMs'
@@ -98,6 +123,7 @@ type Snapshot = BoardInfo & {
   task: string
   workers: Worker[]
   activeAt?: number
+  jobs?: Job[]
   updatedAt: number
   ended?: true
 }
@@ -117,6 +143,8 @@ type Link = {
   // The session's transcript, once found; whether the projects folder was searched.
   transcript: string | null
   searched: boolean
+  // The folder Claude Code writes this session's background output to, once found.
+  tasksDir: string | null
 }
 
 // Module values start over on a reload, when `session.start` sets them again.
@@ -396,6 +424,7 @@ async function writeSlot($: EngineInterface, slot: number, now: number, ended: b
     task: team.find(worker => worker.id === 'main')?.task ?? '',
     workers: team,
     activeAt: await read($, activeAt),
+    jobs: await read($, jobs),
     ...info,
     ...(ended ? { ended: true as const } : {}),
   }
@@ -417,8 +446,11 @@ async function tick($: EngineInterface): Promise<void> {
     link.lastText = ''
     link.transcript = null
     link.searched = false
+    link.tasksDir = null
     await update($, live, held => ({ ...held, slot: null }))
   }
+  // This chat's jobs first: what the slot written below says of them.
+  await tendJobs($, now)
   const snaps = await readSlots($, link.dir)
   let { slot } = await read($, live)
   // Two chats that took one slot together: the one whose write stands keeps it.
@@ -442,7 +474,7 @@ async function tick($: EngineInterface): Promise<void> {
   snaps.forEach((snap, index) => {
     if (index === slot || !isFresh(snap, now) || snap.sessionId === link?.sessionId) return
     const { sessionId, project, task, workers: crew, name, purpose, tasks, files } = snap
-    const peer: Peer = { sessionId, slot: index, project, task, workers: crew, name, purpose, tasks, files }
+    const peer: Peer = { sessionId, slot: index, project, task, workers: crew, name, purpose, tasks, files, jobs: parseJobs(snap.jobs) }
     peers.push(typeof snap.activeAt === 'number' ? { ...peer, activeAt: snap.activeAt } : peer)
   })
   const next: Live = { slot, peers }
@@ -460,8 +492,9 @@ async function tick($: EngineInterface): Promise<void> {
     const past = await readHistory($, now, liveIds)
     if (JSON.stringify(past) !== JSON.stringify(await read($, history))) await update($, history, () => past)
   }
-  // Waiting minutes, the cache's clock and the limits' countdowns move with time alone.
-  if (link.ticks % REDRAW_EVERY === 0) $.ui.invalidate('ui.render')
+  // Waiting minutes, the cache's clock and the limits' countdowns move with time alone;
+  // a running job's output, every tick while the pane shows it.
+  if (link.ticks % REDRAW_EVERY === 0 || (await viewingLiveJob($))) $.ui.invalidate('ui.render')
   link.ticks += 1
 }
 
@@ -477,6 +510,300 @@ function startLive($: EngineInterface): void {
   }
   timer = $.clock.every(TICK_MS, run)
   run()
+}
+
+// ---- Background jobs: this chat's, and every other chat's through its slot ----------
+
+const stopsPath = (dir: string, sessionId: string): string => `${dir}/stop/${sessionId}.json`
+// Stop requests this chat already answered: task id → when the request was made.
+const answeredStops = new Map<string, number>()
+// Stops this pane asked of other chats, by job key: what the list says meanwhile.
+const askedStops = new Map<string, number>()
+// A stop asked of another chat shows as asked this long, then the job's own state again.
+const ASKED_SHOWN_MS = 30 * 1000
+// A job the engine's own list leaves out is taken as ended once it is this old: one
+// started a moment ago may not be on it yet.
+const SETTLE_MS = 5000
+
+// The folder this session's background output goes to: beside a command's output file
+// when one was seen, else looked for under the temp folder Claude Code writes in.
+async function tasksDir($: EngineInterface): Promise<string | null> {
+  if (!link) return null
+  if (link.tasksDir) return link.tasksDir
+  const known = (await read($, jobs)).find(job => job.kind !== 'agent' && job.output)?.output
+  if (known) {
+    link.tasksDir = dirOf(known)
+
+    return link.tasksDir
+  }
+  const temp = (await $.env.get('TEMP')) || (await $.env.get('TMPDIR')) || (await $.env.get('TMP'))
+  if (!temp) return null
+  const root = `${temp}/claude`
+  for (const entry of await $.fs.list(root).catch(() => [])) {
+    if (entry.kind !== 'dir') continue
+    const path = `${root}/${entry.name}/${link.sessionId}/tasks`
+    if (await $.fs.exists(path).catch(() => false)) {
+      link.tasksDir = path
+
+      return path
+    }
+  }
+
+  return null
+}
+
+// A subagent's transcript, beside the session's own: what its job view shows.
+async function agentOutput($: EngineInterface, agentId: string): Promise<string | null> {
+  const transcript = await findTranscript($)
+
+  return transcript ? `${transcript.replace(/\.jsonl$/, '')}/subagents/agent-${agentId}.jsonl` : null
+}
+
+const workerName = async ($: EngineInterface, agentId: string | undefined): Promise<string> =>
+  (await read($, workers)).find(worker => worker.id === (agentId ?? 'main'))?.name ?? 'Şef'
+
+type NewJob = Pick<Job, 'id' | 'kind' | 'tool' | 'title' | 'command' | 'output' | 'by'>
+
+async function addJob($: EngineInterface, job: NewJob): Promise<void> {
+  const at = await $.clock.now()
+  const known = (await read($, jobs)).find(one => one.id === job.id)
+  // Seen again while it runs, it keeps its start; seen again after it ended (a
+  // subagent resumed in the background), it runs anew.
+  const startedAt = known && isLive(known.status) ? known.startedAt : at
+  const fresh: Job = { ...job, startedAt, endedAt: null, status: 'running', summary: '' }
+  await update($, jobs, list => withJob(list, fresh))
+}
+
+async function endJob($: EngineInterface, id: string, status: JobStatus, summary = ''): Promise<void> {
+  const at = await $.clock.now()
+  await update($, jobs, list => changeJob(list, id, job => ended(job, status, at, summary)))
+}
+
+// A Bash, PowerShell or Monitor call whose work goes on in the background: run with
+// `run_in_background`, moved there by hand or by its timeout, or a monitor.
+async function noteBackground(
+  $: EngineInterface,
+  tool: string,
+  input: unknown,
+  result: unknown,
+  text: string | undefined,
+  agentId: string | undefined,
+): Promise<void> {
+  const record = (result ?? {}) as { backgroundTaskId?: unknown; taskId?: unknown }
+  const id = tool === 'Monitor' ? record.taskId : record.backgroundTaskId
+  if (typeof id !== 'string' || !id) return
+  const fields = input as { command?: unknown; description?: unknown }
+  const command = typeof fields.command === 'string' ? fields.command : ''
+  const description = typeof fields.description === 'string' ? fields.description : ''
+  let output = outputPathFrom(text)
+  if (output && link && !link.tasksDir) link.tasksDir = dirOf(output)
+  if (!output) {
+    const dir = await tasksDir($)
+    output = dir ? `${dir}/${id}.output` : null
+  }
+  await addJob($, {
+    id,
+    kind: tool === 'Monitor' ? 'monitor' : 'shell',
+    tool,
+    title: clip(description || headline(command) || id, 80),
+    command: command.slice(0, 1000),
+    output,
+    by: await workerName($, agentId),
+  })
+}
+
+type RunningTask = { id: string; type: string; description: string; command?: string }
+
+const KIND_OF_TASK: Record<string, JobKind> = { shell: 'shell', monitor: 'monitor', subagent: 'agent' }
+const TOOL_OF_KIND: Record<JobKind, string> = { shell: 'Bash', monitor: 'Monitor', agent: 'Agent' }
+
+// The engine's own list of the work it still runs, as a main-loop turn ends: a job
+// not on it has ended, though no notification said so; one this chat never saw start
+// (moved to the background by hand, or started under an older version) joins.
+async function reconcileJobs($: EngineInterface, running: readonly RunningTask[]): Promise<void> {
+  const now = await $.clock.now()
+  const ids = new Set(running.map(task => task.id))
+  for (const job of await read($, jobs)) {
+    if (job.status === 'running' && !ids.has(job.id) && now - job.startedAt >= SETTLE_MS) await endJob($, job.id, 'ended')
+  }
+  const known = new Set((await read($, jobs)).map(job => job.id))
+  for (const task of running) {
+    const kind = KIND_OF_TASK[task.type]
+    if (known.has(task.id) || !kind) continue
+    const dir = kind === 'agent' ? null : await tasksDir($)
+    await addJob($, {
+      id: task.id,
+      kind,
+      tool: TOOL_OF_KIND[kind],
+      title: clip(task.description || headline(task.command ?? '') || task.id, 80),
+      command: (task.command ?? task.description).slice(0, 1000),
+      output: kind === 'agent' ? await agentOutput($, task.id) : dir ? `${dir}/${task.id}.output` : null,
+      by: 'Şef',
+    })
+  }
+}
+
+// Stops one of this chat's jobs as the model would, with TaskStop: an error's text,
+// or null once it stopped (or had already ended).
+async function stopOwnJob($: EngineInterface, id: string): Promise<string | null> {
+  const job = (await read($, jobs)).find(one => one.id === id)
+  if (!job || !isLive(job.status)) return null
+  await update($, jobs, list => changeJob(list, id, one => ({ ...one, status: 'stopping' })))
+  let failure: string
+  try {
+    const ran = await $.tool.call({ tool: 'TaskStop', task_id: id })
+    if (ran.deny === undefined && !ran.isError) {
+      await endJob($, id, 'killed', 'Piksel Ofis panelinden durduruldu.')
+
+      return null
+    }
+    failure = ran.deny ?? ran.text ?? 'TaskStop bir hata döndürdü.'
+  } catch (error) {
+    failure = errorText(error)
+  }
+  // A task the engine no longer runs has ended by itself.
+  if (/not found|no (running |such )?(background )?task|not running|already (stopped|finished|completed)/i.test(failure)) {
+    await endJob($, id, 'ended')
+
+    return null
+  }
+  await update($, jobs, list => changeJob(list, id, one => (one.status === 'stopping' ? { ...one, status: 'running' } : one)))
+
+  return failure
+}
+
+// What a job's chat runs each tick: its subagents' standing, the stops other chats
+// asked of it, and the finished jobs that aged off the list.
+async function tendJobs($: EngineInterface, now: number): Promise<void> {
+  if (!link) return
+  const own = await read($, jobs)
+  if (own.some(job => job.kind === 'agent' && job.status === 'running')) {
+    const agents = await $.agent.list().catch(() => [])
+    for (const job of own) {
+      if (job.kind !== 'agent' || job.status !== 'running') continue
+      const status = agents.find(agent => agent.id === job.id)?.status
+      if (status === 'completed' || status === 'failed' || status === 'killed') await endJob($, job.id, status)
+    }
+  }
+  const text = await $.fs.read(stopsPath(link.dir, link.sessionId)).catch(() => '')
+  if (typeof text === 'string' && text) {
+    for (const [id, at] of Object.entries(parseStops(text))) {
+      if (now - at > STOP_REQUEST_MS || answeredStops.get(id) === at) continue
+      answeredStops.set(id, at)
+      const job = own.find(one => one.id === id)
+      if (!job || !isLive(job.status)) continue
+      const failed = await stopOwnJob($, id)
+      if (failed) $.ui.log(`Arka plan işi durdurulamadı (${job.title}): ${failed}`)
+      else void $.ui.toast(`Başka bir sohbetin panelinden durduruldu: ${job.title}`)
+    }
+  }
+  const before = await read($, jobs)
+  const kept = prunedJobs(before, now)
+  if (kept.length !== before.length) await update($, jobs, () => kept)
+}
+
+// Every chat's jobs as the list shows them.
+async function allJobs($: EngineInterface): Promise<SharedJob[]> {
+  const held = await read($, live)
+  const crew = await read($, workers)
+  const info = await read($, board)
+  const mine = (await read($, jobs)).map(
+    (job): SharedJob => ({
+      ...job,
+      sessionId: link?.sessionId ?? 'bu-sohbet',
+      label: held.slot === null ? '' : `#${held.slot + 1}`,
+      chat: info.name || info.purpose || 'bu sohbet',
+      isOwn: true,
+      isChatIdle: !crew.some(worker => worker.status === 'working'),
+    }),
+  )
+  const theirs = held.peers.flatMap(peer =>
+    (peer.jobs ?? []).map(
+      (job): SharedJob => ({
+        ...job,
+        sessionId: peer.sessionId,
+        label: `#${peer.slot + 1}`,
+        chat: titleOf(peer),
+        isOwn: false,
+        isChatIdle: !peer.workers.some(worker => worker.status === 'working'),
+      }),
+    ),
+  )
+
+  return sortedJobs([...mine, ...theirs])
+}
+
+async function viewingLiveJob($: EngineInterface): Promise<boolean> {
+  const view = await read($, jobView)
+  if (!view.key) return false
+  const job = (await allJobs($)).find(one => jobKey(one) === view.key)
+
+  return !!job && isLive(job.status)
+}
+
+// Stops a job: this chat's at once, another chat's by a request its own chat answers
+// on its next tick (only a session can stop its own tasks).
+async function stopJob($: EngineInterface, job: SharedJob): Promise<void> {
+  await update($, jobView, view => ({ ...view, confirm: 0 as const }))
+  if (job.isOwn) {
+    const failed = await stopOwnJob($, job.id)
+    void $.ui.toast(failed ? `Durdurulamadı: ${failed}` : `Durduruldu: ${job.title}`)
+
+    return
+  }
+  if (!link) return
+  const path = stopsPath(link.dir, job.sessionId)
+  const before = await $.fs.read(path).catch(() => '')
+  const asked = typeof before === 'string' ? parseStops(before) : {}
+  const now = await $.clock.now()
+  const kept = Object.fromEntries(Object.entries(asked).filter(([, at]) => now - at < STOP_REQUEST_MS))
+  try {
+    await $.fs.write(path, JSON.stringify({ ...kept, [job.id]: now }))
+  } catch (error) {
+    void $.ui.toast(`Durdurma isteği yazılamadı: ${errorText(error)}`)
+
+    return
+  }
+  askedStops.set(jobKey(job), now)
+  void $.ui.toast(`${job.label} sohbetine durdurma isteği gönderildi: ${job.title}`)
+  $.ui.invalidate('ui.render')
+}
+
+type OutputShown = { text: string; page: number; pages: number; note: string; writtenAt: number | null }
+
+// One page of a job's output, read from its file now: the owner's chat is not asked.
+async function readOutput($: EngineInterface, job: Job, page: number): Promise<OutputShown> {
+  const empty = (note: string): OutputShown => ({ text: '', page: 0, pages: 1, note, writtenAt: null })
+  if (!job.output) return empty('Bu işin çıktı dosyası bilinmiyor.')
+  const stat = await $.fs.stat(job.output).catch(() => null)
+  if (!stat || stat.kind !== 'file') return empty(isLive(job.status) ? 'Henüz çıktı yok.' : 'Çıktı dosyası artık yok.')
+  const range = pageRange(stat.size, page)
+  const raw = range.end > range.start ? await $.fs.read(job.output, { offset: range.start, length: range.end - range.start }) : ''
+  const text = pageText(raw, range.start > 0, job.kind === 'agent')
+  const note = text ? '' : isLive(job.status) ? 'Henüz çıktı yok.' : 'İş çıktı yazmadı.'
+
+  return { text, page: range.page, pages: range.pages, note, writtenAt: stat.mtimeMs }
+}
+
+const JOB_MARKS: Record<JobStatus, string> = { running: '▶', stopping: '■', completed: '✓', failed: '✗', killed: '■', ended: '✓' }
+
+// The job's state as its row reads: a stop asked of another chat shows until it lands.
+function jobState(job: SharedJob, now: number): string {
+  const asked = askedStops.get(jobKey(job))
+  if (isLive(job.status) && asked !== undefined && now - asked < ASKED_SHOWN_MS) return 'durdurma istendi'
+  const span = (job.endedAt ?? now) - job.startedAt
+
+  return `${jobStatusWord(job.status)} · ${durationText(span)}`
+}
+
+async function openJob($: EngineInterface, job: SharedJob): Promise<void> {
+  await update($, jobView, () => ({ key: jobKey(job), page: 0, confirm: 0 as const }))
+  await $.ui.scroll({ to: 'start', in: PANE }).catch(() => undefined)
+}
+
+async function backToOffice($: EngineInterface): Promise<void> {
+  await update($, jobView, () => OFFICE_VIEW)
+  await $.ui.scroll({ to: 'start', in: PANE }).catch(() => undefined)
 }
 
 // ---- A newer version on disk ---------------------------------------------------------
@@ -754,6 +1081,7 @@ export const register: Register = on => {
           failed: false,
           transcript: null,
           searched: false,
+          tasksDir: null,
         }
         // A resumed chat finds its own entry again: its name and purpose stay.
         const before = await $.fs.read(journalPath(dir, sessionId)).catch(() => '')
@@ -819,8 +1147,11 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     const at = await $.clock.now()
     if (e.agentId === undefined) {
-      // A new request for the main session: the finished helpers go home.
-      const task = clip(headline(e.text), 60)
+      // A new request for the main session: the finished helpers go home. A turn a
+      // background task's notification started keeps the task the chat was on.
+      const isNotice = e.text.trimStart().startsWith('<task-notification>')
+      const current = (await read($, workers)).find(worker => worker.id === 'main')?.task ?? ''
+      const task = isNotice ? current : clip(headline(e.text), 60)
       turnStartedAt = at
       contextAtStart = (await read($, usage))?.contextTokens ?? null
       await update($, activeAt, () => at)
@@ -832,7 +1163,7 @@ export const register: Register = on => {
               worker.id === 'main' ? { ...worker, status: 'working', station: 'board', tool: null, task, tools: 0, startedAt: at } : worker,
           ),
       )
-      await changeBoard($, info => withTask(info, task))
+      if (!isNotice) await changeBoard($, info => withTask(info, task))
     } else {
       const hire: Worker = { ...MAIN, id: e.agentId, name: 'Yardımcı', role: 'yardımcı', startedAt: at }
       await touch($, e.agentId, worker => ({ ...worker, status: 'working', station: 'board', tool: null }), hire)
@@ -850,11 +1181,27 @@ export const register: Register = on => {
         $.ui.log(`Ofis güncellenemedi: ${errorText(error)}`),
       )
     }
+    const agentId = started.agentId
+    if (agentId && e.background) {
+      const job = async (): Promise<void> =>
+        addJob($, {
+          id: agentId,
+          kind: 'agent',
+          tool: 'Agent',
+          title: clip(e.description || e.subagentType, 80),
+          command: e.prompt.slice(0, 1000),
+          output: await agentOutput($, agentId),
+          by: await workerName($, e.parentAgentId),
+        })
+      await job().catch((error: unknown) => $.ui.log(`Arka plan işi kaydedilemedi: ${errorText(error)}`))
+    }
 
     return started
   })
 
   on('tool.call', async ($, e, next) => {
+    // The pane's own calls (a stop the person asked for) are no work of the chat's.
+    if (next.origin.plugin === $.plugin.name) return next(e)
     const id = e.agentId ?? 'main'
     const tool = String(e.tool)
     const at = await $.clock.now()
@@ -884,6 +1231,11 @@ export const register: Register = on => {
       return { deny: heldWriteText(conflicts, await fileDiff($, path), now) }
     }
     const ran = await next(e)
+    if (ran.deny === undefined && !ran.isError && (tool === 'Bash' || tool === 'PowerShell' || tool === 'Monitor')) {
+      await noteBackground($, tool, e, ran.result, ran.text, e.agentId).catch((error: unknown) =>
+        $.ui.log(`Arka plan işi kaydedilemedi: ${errorText(error)}`),
+      )
+    }
     if (ran.deny !== undefined || ran.isError || !path) return ran
     await changeBoard($, info => ({ ...info, files: withFile(info.files, { path, at: now, tool }) })).catch((error: unknown) =>
       $.ui.log(`Pano güncellenemedi: ${errorText(error)}`),
@@ -927,6 +1279,29 @@ export const register: Register = on => {
     return { result: await sendToChat($, to, text) }
   })
 
+  // A background task's notification says how it ended.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind === 'task-notification' || e.text.includes('<task-notification>')) {
+      for (const notice of parseNotices(e.text)) {
+        await endJob($, notice.id, notice.status, notice.summary).catch((error: unknown) =>
+          $.ui.log(`Arka plan işinin sonu kaydedilemedi: ${errorText(error)}`),
+        )
+      }
+    }
+
+    return next(e)
+  })
+
+  // As the main loop stops, the engine lists the work it still runs in the background.
+  on('classic.Stop', async ($, e, next) => {
+    const running = e.background_tasks
+    if (Array.isArray(running)) {
+      await reconcileJobs($, running).catch((error: unknown) => $.ui.log(`Arka plan işleri denetlenemedi: ${errorText(error)}`))
+    }
+
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId ?? 'main'
     const failed = e.reason === 'error' || e.reason === 'refusal'
@@ -947,7 +1322,134 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const table = $.ui.resolve(e)
-    const { Box, Text, Button } = table
+    const { Box, Text, Button, Code } = table
+    const view = await read($, jobView)
+    const shared = await allJobs($)
+
+    if (view.key) {
+      const now = await $.clock.now()
+      const job = shared.find(one => jobKey(one) === view.key)
+      if (!job) {
+        return (
+          <Box flexDirection="column" gap={1}>
+            <Box flexDirection="row">
+              <Button key="ofise-don" onPress={() => void backToOffice($)}>
+                ← Ofise dön
+              </Button>
+            </Box>
+            <Text dimColor wrap="wrap">
+              Bu iş artık listede yok: sohbeti kapanmış ya da bitişinin üstünden yarım saat geçmiş olabilir.
+            </Text>
+          </Box>
+        )
+      }
+      const shown = await readOutput($, job, view.page)
+      const live = isLive(job.status)
+      const asked = askedStops.get(jobKey(job))
+      const isAsked = live && asked !== undefined && now - asked < ASKED_SHOWN_MS
+      const owner = `${job.label ? `${job.label} ` : ''}${job.chat}${job.isOwn ? ' (bu sohbet)' : ''}`
+      const writtenAgo = shown.writtenAt === null ? '' : ` · son çıktı ${durationText(now - shown.writtenAt)} önce`
+      const page = (to: number): void => void update($, jobView, held => ({ ...held, page: to }))
+      const confirm = (step: 0 | 1 | 2): void => void update($, jobView, held => ({ ...held, confirm: step }))
+
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Box flexDirection="row" flexWrap="wrap" gap={1}>
+            <Button key="ofise-don" onPress={() => void backToOffice($)}>
+              ← Ofise dön
+            </Button>
+            {live && view.confirm === 0 && !isAsked && (
+              <Button key="is-durdur" onPress={() => confirm(1)}>
+                İşi durdur…
+              </Button>
+            )}
+            <Button key="sona-git" dimColor onPress={() => void $.ui.scroll({ to: 'end', in: PANE }).catch(() => undefined)}>
+              Sona git ↓
+            </Button>
+          </Box>
+          <Text bold wrap="wrap">
+            {JOB_MARKS[job.status]} {job.title}
+          </Text>
+          <Text dimColor wrap="wrap">
+            {owner} · {KIND_WORDS[job.kind]} ({job.tool}) · {job.by} · {jobState(job, now)}
+            {live ? writtenAgo : ''}
+          </Text>
+          {job.summary && <Text wrap="wrap">{job.summary}</Text>}
+          {live && job.isChatIdle && !job.isOwn && (
+            <Text color="warning" wrap="wrap">
+              Bu işin sohbetinde şu an kimse çalışmıyor: iş unutulmuş olabilir.
+            </Text>
+          )}
+          {live && view.confirm === 1 && (
+            <Box flexDirection="column" gap={1}>
+              <Text color="warning" wrap="wrap">
+                “{job.title}” işini durdurmak istediğine emin misin?
+              </Text>
+              <Box flexDirection="row" gap={1}>
+                <Button key="durdur-onay-1" onPress={() => confirm(2)}>
+                  Evet, devam
+                </Button>
+                <Button key="durdur-vazgec" onPress={() => confirm(0)}>
+                  Vazgeç
+                </Button>
+              </Box>
+            </Box>
+          )}
+          {live && view.confirm === 2 && (
+            <Box flexDirection="column" gap={1}>
+              <Text color="error" wrap="wrap">
+                Son onay: {owner} sohbetinin bu işi şimdi durdurulacak. Geri alınamaz; o sohbetin modeline işin durdurulduğu bildirilir.
+              </Text>
+              <Box flexDirection="row" gap={1}>
+                <Button key="durdur-onay-2" variant="primary" onPress={() => void stopJob($, job)}>
+                  Evet, durdur
+                </Button>
+                <Button key="durdur-vazgec" onPress={() => confirm(0)}>
+                  Vazgeç
+                </Button>
+              </Box>
+            </Box>
+          )}
+          {job.command && job.command !== job.title && (
+            <Text dimColor wrap="wrap">
+              {job.kind === 'agent' ? 'Görev' : 'Komut'}: {clip(job.command, 400)}
+            </Text>
+          )}
+          {shown.pages > 1 && (
+            <Box flexDirection="row" flexWrap="wrap" gap={1}>
+              {shown.page < shown.pages - 1 && (
+                <Button key="daha-eski" onPress={() => page(shown.page + 1)}>
+                  ◀ Daha eski
+                </Button>
+              )}
+              <Text dimColor>
+                Sayfa {shown.pages - shown.page}/{shown.pages}
+              </Text>
+              {shown.page > 0 && (
+                <Button key="daha-yeni" onPress={() => page(shown.page - 1)}>
+                  Daha yeni ▶
+                </Button>
+              )}
+              {shown.page > 1 && (
+                <Button key="en-yeni" onPress={() => page(0)}>
+                  En yeni
+                </Button>
+              )}
+            </Box>
+          )}
+          {shown.text ? <Code source={shown.text} wrap="wrap" /> : <Text dimColor>{shown.note}</Text>}
+          <Box flexDirection="row" flexWrap="wrap" gap={1}>
+            <Button key="ofise-don-alt" onPress={() => void backToOffice($)}>
+              ← Ofise dön
+            </Button>
+            <Button key="basa-don" dimColor onPress={() => void $.ui.scroll({ to: 'start', in: PANE }).catch(() => undefined)}>
+              Başa dön ↑
+            </Button>
+          </Box>
+        </Box>
+      )
+    }
+
     // The terminal has no Svg: it gets the office as text.
     // The surface decides, not `in`: a table answers for names it lacks too.
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
@@ -960,6 +1462,7 @@ export const register: Register = on => {
     const gauge = cacheGauge(await read($, tokens), await read($, cacheTtl), now)
     const percent = meters?.contextPercent ?? 0
     const fresh = await read($, newer)
+    const runningCount = shared.filter(job => isLive(job.status)).length
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -979,6 +1482,28 @@ export const register: Register = on => {
             <Button key="sikistir" onPress={() => void compactNow($)}>
               Pano özetiyle sıkıştır (bağlam %{percent})
             </Button>
+          </Box>
+        )}
+        {shared.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>
+              Arka plan işleri · {runningCount > 0 ? `${runningCount} çalışıyor` : 'çalışan yok'}
+            </Text>
+            {shared.map(job => (
+              <Button
+                key={`is-${jobKey(job)}`}
+                label={`${JOB_MARKS[job.status]} ${job.label ? `${job.label} ` : ''}${clip(job.title, 48)} · ${jobState(job, now)}${
+                  isLive(job.status) && job.isChatIdle && !job.isOwn ? ' · sohbeti boşta' : ''
+                }`}
+                dimColor={!isLive(job.status)}
+                onPress={() => void openJob($, job)}
+              >
+                {JOB_MARKS[job.status]} {job.label ? `${job.label} ` : ''}
+                {clip(job.title, 48)}
+                <Text dimColor> · {jobState(job, now)}</Text>
+                {isLive(job.status) && job.isChatIdle && !job.isOwn ? <Text color="warning"> · sohbeti boşta</Text> : ''}
+              </Button>
+            ))}
           </Box>
         )}
       </Box>

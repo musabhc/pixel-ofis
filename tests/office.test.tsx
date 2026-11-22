@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import type { TestBody } from 'claude-code/testing'
 
 const PANE = {
   plugin: 'pixel-ofis',
@@ -16,6 +17,10 @@ const PANE = {
 } as const
 
 const NOW = Date.parse('2026-11-03T12:00:00Z')
+const bytes = new TextEncoder()
+const TEMP_DIR = 'C:\\Users\\demo\\AppData\\Local\\Temp'
+// Where Claude Code writes this session's background output.
+const TASKS = `${TEMP_DIR}\\claude\\h1\\me\\tasks`
 const MINUTE = 60 * 1000
 const HOME = 'C:\\Users\\demo'
 const LIVE = `${HOME}/.claude/pixel-ofis-live`
@@ -69,6 +74,10 @@ type World = {
   manifest?: { version: string }
   // The rate-limit windows this chat's last response reported.
   limits?: { kind: string; percentUsed: number; resetsAt?: string }[]
+  // What a tool call answers, when not the empty record.
+  tool?: (e: { tool: string } & Record<string, unknown>) => { result: unknown; text?: string } | undefined
+  // The session's agents, as `$.agent.list()` answers them.
+  agents?: { id: string; status: string }[]
 }
 
 // The engine beneath the plugin: a session, a disk in memory and the person's actions.
@@ -77,12 +86,14 @@ function world(on: On, files: Map<string, string> = new Map(), more: World = {})
   const notes: string[] = []
   const sends: string[] = []
   const compacts: string[] = []
+  // The tools the plugin itself called, with their input.
+  const calls: ({ tool: string } & Record<string, unknown>)[] = []
   for (const [path, text] of [...files]) {
     files.delete(path)
     files.set(norm(path), text)
   }
   const clock = mock.clock(on, { now: NOW })
-  mock.env(on, { USERPROFILE: HOME })
+  mock.env(on, { USERPROFILE: HOME, TEMP: TEMP_DIR })
   mock.store(on)
   on('command.register', () => ({ value: { command: 'ofis' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
@@ -108,7 +119,15 @@ function world(on: On, files: Map<string, string> = new Map(), more: World = {})
     value: { exitCode: more.diff === undefined ? 128 : 0, stdout: more.diff ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
   }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
-  on('tool.call', () => ({ result: {} }))
+  on('tool.call', (_, e, next) => {
+    const input = e as unknown as { tool: string } & Record<string, unknown>
+    if (next.origin.plugin === 'pixel-ofis') calls.push(input)
+
+    return more.tool?.(input) ?? { result: {} }
+  })
+  on('agent.list', () => ({ value: (more.agents ?? []) as never }))
+  on('ui.scroll', () => ({}))
+  on('classic.Stop', () => ({}))
   on('agent.spawn', (_, e) => ({ model: 'sonnet', agentId: e.fork ? 'f1' : 'a1' }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   on('prompt.submit', (_, e) => {
@@ -131,13 +150,22 @@ function world(on: On, files: Map<string, string> = new Map(), more: World = {})
 
     return { value: entries }
   })
-  on('fs.exists', (_, e) => ({ value: files.has(norm(e.path)) }))
+  on('fs.exists', (_, e) => ({ value: files.has(norm(e.path)) || [...files.keys()].some(path => path.startsWith(`${norm(e.path)}\\`)) }))
+  on('fs.stat', (_, e) => {
+    const text = files.get(norm(e.path))
+    if (text === undefined) throw new Error('ENOENT')
+
+    return { value: { kind: 'file' as const, size: bytes.encode(text).length, mtimeMs: NOW - 4000, isLink: false } }
+  })
   on('fs.read', (_, e) => {
     if (more.manifest && /[\\/]\.claude-plugin[\\/]plugin\.json$/.test(e.path)) return { value: JSON.stringify(more.manifest) }
     const text = files.get(norm(e.path))
     if (text === undefined) throw new Error('ENOENT')
+    if (e.offset === undefined && e.length === undefined) return { value: text }
+    const all = bytes.encode(text)
+    const start = e.offset ?? 0
 
-    return { value: text }
+    return { value: new TextDecoder().decode(all.slice(start, e.length === undefined ? undefined : start + e.length)) }
   })
   on('fs.write', (_, e) => {
     files.set(norm(e.path), e.text)
@@ -145,10 +173,10 @@ function world(on: On, files: Map<string, string> = new Map(), more: World = {})
     return { value: undefined }
   })
 
-  return { clock, files, toasts, notes, sends, compacts }
+  return { clock, files, toasts, notes, sends, compacts, calls }
 }
 
-async function office($: Parameters<Parameters<typeof test>[1]>[0]) {
+async function office($: Parameters<TestBody>[0]) {
   const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
   const svg = await ui.find({ type: 'Svg' })
   const found = { alt: String(svg?.props.alt), source: String(svg?.props.source), ui }
@@ -680,4 +708,229 @@ test('the terminal, which has no Svg, gets the office as text', async ($, on) =>
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /Piksel ofis/ }))?.text).toContain('Bekleme odası: Şef (az önce)')
   await ui.unmount()
+})
+
+// ---- Background jobs ----------------------------------------------------------------
+
+const ESC = String.fromCharCode(27)
+
+const bashInBackground = (id: string) => (e: { tool: string } & Record<string, unknown>) =>
+  e.tool === 'Bash' && e.run_in_background
+    ? {
+        result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: id },
+        text: `Command running in background with ID: ${id}. Output is being written to: ${TASKS}\\${id}.output. You will be notified when it completes.`,
+      }
+    : undefined
+
+const jobButton = async (ui: Awaited<ReturnType<typeof office>>['ui'], key: string) => (await ui.find({ key: `is-${key}` }))?.text ?? ''
+
+test('a background command is listed under the office; its output opens in its place and the office comes back', { timeoutMs: 15000 }, async ($, on) => {
+  const files = new Map([[`${TASKS}\\b1.output`, `${ESC}[32mPASSED${ESC}[0m test_giris\r\n10%\r50%\r100%\nbitti\n`]])
+  world(on, files, { tool: bashInBackground('b1') })
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  await $.turn.start({ text: 'testleri koş', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'python -m pytest tests/ui -q', description: 'UI testleri', run_in_background: true })
+
+  const { ui } = await office($)
+  expect(String((await ui.find({ type: 'Text' }))?.text)).toContain('Arka plan işleri · 1 çalışıyor')
+  expect(await jobButton(ui, 'me:b1')).toContain('#1 UI testleri')
+  expect(await jobButton(ui, 'me:b1')).toContain('çalışıyor · 0 sn')
+  await ui.press({ key: 'is-me:b1' })
+
+  // The office makes room for the job: its output, cleaned of colour codes and of the
+  // progress a line rewrote, and a way back.
+  expect(await ui.find({ type: 'Svg' })).toBeUndefined()
+  const output = String((await ui.find({ type: 'Code' }))?.props.source)
+  expect(output).toBe('PASSED test_giris\n100%\nbitti\n')
+  expect(await ui.find({ key: 'is-durdur' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Komut: python -m pytest tests/ui -q' })).toBeDefined()
+  await ui.press({ key: 'ofise-don-alt' })
+  expect(await ui.find({ type: 'Svg' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a long output reads page by page, the newest first', { timeoutMs: 15000 }, async ($, on) => {
+  const lines = Array.from({ length: 12000 }, (_, at) => `satır ${String(at).padStart(5, '0')} ................`)
+  const files = new Map([[`${TASKS}\\b1.output`, `${lines.join('\n')}\n`]])
+  world(on, files, { tool: bashInBackground('b1') })
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'uzun', run_in_background: true })
+  const { ui } = await office($)
+  await ui.press({ key: 'is-me:b1' })
+  const newest = String((await ui.find({ type: 'Code' }))?.props.source)
+  expect(newest).toContain('satır 11999')
+  expect(newest).not.toContain('satır 00000')
+  expect(newest.length).toBeLessThanOrEqual(90000)
+  expect(await ui.find({ key: 'daha-yeni' })).toBeUndefined()
+  for (let pages = 0; pages < 10 && (await ui.find({ key: 'daha-eski' })); pages += 1) await ui.press({ key: 'daha-eski' })
+  const oldest = String((await ui.find({ type: 'Code' }))?.props.source)
+  expect(oldest.startsWith('satır 00000')).toBe(true)
+  expect(await ui.find({ key: 'daha-eski' })).toBeUndefined()
+  await ui.press({ key: 'en-yeni' })
+  expect(String((await ui.find({ type: 'Code' }))?.props.source)).toContain('satır 11999')
+  await ui.unmount()
+})
+
+const peerJob = {
+  id: 'b9',
+  kind: 'shell',
+  tool: 'Bash',
+  title: 'pytest tests/ui',
+  command: 'python -m pytest tests/ui -q',
+  output: `${TEMP_DIR}\\claude\\h1\\other\\tasks\\b9.output`,
+  by: 'Şef',
+  startedAt: NOW - 20 * MINUTE,
+  endedAt: null,
+  status: 'running',
+  summary: '',
+}
+
+const peerWithJob = (updatedAt: number) =>
+  JSON.stringify({ ...JSON.parse(peer('other', 'Giriş hatası', NOW - 15 * MINUTE, updatedAt)), jobs: [peerJob] })
+
+test("another chat's job shows in every pane, even after its chat left the office; stopping it asks twice", { timeoutMs: 15000 }, async ($, on) => {
+  const files = new Map([
+    [`${LIVE}/slot-0.json`, peerWithJob(NOW - 2000)],
+    [peerJob.output, 'collected 40 items\n'],
+  ])
+  const { clock } = world(on, files)
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  const first = await office($)
+  expect(await jobButton(first.ui, 'other:b9')).toContain('#1 pytest tests/ui')
+  expect(await jobButton(first.ui, 'other:b9')).toContain('20 dk 0 sn')
+  // Nobody works in that chat: the job may have been forgotten.
+  expect(await jobButton(first.ui, 'other:b9')).toContain('sohbeti boşta')
+  await first.ui.unmount()
+
+  // Its chat sat past the waiting room's limit and left the drawing: the job stays listed.
+  await clock.advance(20 * MINUTE)
+  files.set(norm(`${LIVE}/slot-0.json`), peerWithJob(NOW + 20 * MINUTE - 1000))
+  await clock.advance(3000)
+  const { ui, alt } = await office($)
+  expect(alt).not.toContain('Giriş hatası')
+  expect(await jobButton(ui, 'other:b9')).toContain('#1 pytest tests/ui')
+
+  await ui.press({ key: 'is-other:b9' })
+  expect(String((await ui.find({ type: 'Code' }))?.props.source)).toBe('collected 40 items\n')
+  // A first press asks, a second asks again, and either can be taken back.
+  await ui.press({ key: 'is-durdur' })
+  expect(await ui.find({ key: 'is-durdur' })).toBeUndefined()
+  await ui.press({ key: 'durdur-vazgec' })
+  expect(await ui.find({ key: 'durdur-onay-1' })).toBeUndefined()
+  await ui.press({ key: 'is-durdur' })
+  await ui.press({ key: 'durdur-onay-1' })
+  expect(await ui.find({ key: 'durdur-onay-1' })).toBeUndefined()
+  expect(files.has(norm(`${LIVE}/stop/other.json`))).toBe(false)
+  await ui.press({ key: 'durdur-onay-2' })
+
+  // Only a session stops its own tasks: the request waits for that chat in the live folder.
+  const asked = JSON.parse(String(files.get(norm(`${LIVE}/stop/other.json`)))) as Record<string, number>
+  expect(Object.keys(asked)).toEqual(['b9'])
+  expect(await ui.find({ key: 'is-durdur' })).toBeUndefined()
+  await ui.press({ key: 'ofise-don' })
+  expect(await jobButton(ui, 'other:b9')).toContain('durdurma istendi')
+  await ui.unmount()
+})
+
+test("a chat stops its own job with TaskStop when another chat's pane asks", { timeoutMs: 15000 }, async ($, on) => {
+  const { clock, files, calls, toasts } = world(on, new Map(), { tool: bashInBackground('b1') })
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  await $.turn.start({ text: 'izle', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'npm run watch', run_in_background: true })
+  await $.turn.complete({ ...ANSWER, turnId: 't1' })
+
+  files.set(norm(`${LIVE}/stop/me.json`), JSON.stringify({ b1: NOW + 1000 }))
+  await clock.advance(3000)
+  expect(calls.map(call => [call.tool, call.task_id])).toEqual([['TaskStop', 'b1']])
+  expect(toasts.at(-1)).toBe('Başka bir sohbetin panelinden durduruldu: npm run watch')
+  const slot = JSON.parse(String(files.get(norm(`${LIVE}/slot-0.json`)))) as { jobs: { id: string; status: string }[]; workers: { status: string }[] }
+  expect(slot.jobs.map(job => `${job.id} ${job.status}`)).toEqual(['b1 killed'])
+  // The pane's own call is no work of the chief's.
+  expect(slot.workers[0]?.status).toBe('idle')
+
+  // The request is answered once.
+  await clock.advance(3000)
+  expect(calls.length).toBe(1)
+})
+
+test('this chat stops its own job at once, after the same two confirmations', { timeoutMs: 15000 }, async ($, on) => {
+  const { calls } = world(on, new Map(), { tool: bashInBackground('b1') })
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'npm run watch', run_in_background: true })
+  const { ui } = await office($)
+  await ui.press({ key: 'is-me:b1' })
+  await ui.press({ key: 'is-durdur' })
+  await ui.press({ key: 'durdur-onay-1' })
+  expect(calls.length).toBe(0)
+  await ui.press({ key: 'durdur-onay-2' })
+  expect(calls.map(call => [call.tool, call.task_id])).toEqual([['TaskStop', 'b1']])
+  expect(await ui.find({ type: 'Text', text: 'durduruldu' })).toBeDefined()
+  expect(await ui.find({ key: 'is-durdur' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("a job ends by its notification, or by leaving the engine's list; one never seen joins", { timeoutMs: 15000 }, async ($, on) => {
+  let next = 1
+  const { clock } = world(on, new Map(), {
+    tool: e => (e.tool === 'Bash' && e.run_in_background ? bashInBackground(`b${next++}`)(e) : undefined),
+  })
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  await $.turn.start({ text: 'iki iş', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'npm test', run_in_background: true })
+  await $.tool.call({ tool: 'Bash', command: 'npm run lint', run_in_background: true })
+  await $.turn.complete({ ...ANSWER, turnId: 't1' })
+
+  const notice =
+    '<task-notification>\n<task-id>b1</task-id>\n<status>failed</status>\n<summary>Background command "npm test" failed with exit code 1</summary>\n</task-notification>'
+  await $.prompt.submit({ text: notice, wait: false, origin: { kind: 'task-notification' } })
+  // The notification's turn is no new task of the chat.
+  await $.turn.start({ text: notice, turnId: 't2' })
+  const { ui, alt } = await office($)
+  expect(alt).toContain('iki iş')
+  expect(await jobButton(ui, 'me:b1')).toContain('hata verdi')
+  await ui.press({ key: 'is-me:b1' })
+  expect(await ui.find({ type: 'Text', text: 'failed with exit code 1' })).toBeDefined()
+  await ui.unmount()
+
+  await clock.advance(10000)
+  const stop = { session_id: 'me', transcript_path: '', cwd: '', hook_event_name: 'Stop' as const, stop_hook_active: false }
+  await $.classic.Stop({ ...stop, background_tasks: [{ id: 'b7', type: 'shell', status: 'running', description: 'Sunucu', command: 'npm run dev' }] })
+  const after = await office($)
+  await after.ui.press({ key: 'ofise-don' })
+  expect(await jobButton(after.ui, 'me:b2')).toContain('bitti')
+  expect(await jobButton(after.ui, 'me:b7')).toContain('Sunucu')
+  expect(await jobButton(after.ui, 'me:b7')).toContain('çalışıyor')
+  await after.ui.unmount()
+})
+
+test("a subagent sent to the background is a job; its transcript reads as a log", { timeoutMs: 15000 }, async ($, on) => {
+  const log = [
+    { type: 'user', message: { role: 'user', content: 'Arama ekranını incele' } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Önce arama kodunu buluyorum.' }, { type: 'tool_use', name: 'Grep', input: { pattern: 'SearchBox' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', content: 'src/search.tsx:12' }] } },
+  ]
+    .map(row => JSON.stringify(row))
+    .join('\n')
+  const files = new Map([
+    [TRANSCRIPT, ''],
+    [`${HOME}/.claude/projects/C--work-demo-app/me/subagents/agent-a1.jsonl`, `${log}\n`],
+  ])
+  const agents = [{ id: 'a1', status: 'running' }]
+  const { clock } = world(on, files, { agents })
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  await $.turn.start({ text: 'araştır', turnId: 't1' })
+  await $.agent.spawn({ ...SPAWN, background: true, prompt: 'Arama ekranını incele', description: 'arama ekranı', subagentType: 'Explore' })
+
+  const { ui } = await office($)
+  expect(await jobButton(ui, 'me:a1')).toContain('arama ekranı')
+  await ui.press({ key: 'is-me:a1' })
+  const text = String((await ui.find({ type: 'Code' }))?.props.source)
+  expect(text).toBe('— Görev —\nArama ekranını incele\nÖnce arama kodunu buluyorum.\n▶ Grep: SearchBox\n  ↳ src/search.tsx:12')
+  await ui.unmount()
+
+  agents[0] = { id: 'a1', status: 'completed' }
+  await clock.advance(3000)
+  const after = await office($)
+  expect(await after.ui.find({ type: 'Text', text: 'bitti' })).toBeDefined()
+  await after.ui.unmount()
 })

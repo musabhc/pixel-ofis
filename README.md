@@ -22,6 +22,13 @@ kullandıkları araca göre ofisteki istasyonlara yürür: kitaplık (okuma/aram
   sohbet başına bir kez söylenir. Başka bir sohbetin yakın zamanda değiştirdiği dosyanın
   üzerine körlemesine yazılmaz. `ofis_mesaj` aracıyla sohbetler birbirine numarasıyla mesaj
   atabilir.
+- **Arka plan işleri:** bütün sohbetlerin arka planda bıraktığı işler (arka planda çalışan
+  komutlar ve testler, izleyiciler, arka plana gönderilen alt ajanlar) ofisin altında
+  listelenir; bir sohbet bekleme odasından çıkmış olsa da işi listede kalır. Sohbeti kimse
+  çalışmıyorken süren iş "sohbeti boşta" diye işaretlenir. Bir işe tıklayınca ofisin yerine
+  işin bütün çıktısı gelir: çalışırken canlı yenilenir, uzun çıktı sayfa sayfa geriye
+  okunur, "Ofise dön" ile geri dönülür. "İşi durdur" iki kez onay ister; başka bir sohbetin
+  işi, o sohbete iletilen istekle birkaç saniye içinde durdurulur.
 - **Göstergeler:** 5 saatlik ve 7 günlük kullanım limiti, bağlam doluluğu, prompt önbelleği
   (kafedeki kahve önbellek sıcakken tüter, soğuyunca söner), maliyet.
 
